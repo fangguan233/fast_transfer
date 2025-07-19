@@ -68,6 +68,7 @@ class FileTransferApp:
         self.timeout_var = tk.StringVar(value="10")
         self.debug_mode_var = tk.BooleanVar(value=False)
         self.copy_only_var = tk.BooleanVar(value=False)
+        self.enable_intra_disk_check = True # 将从配置文件加载
         
         # --- UI Layout ---
         # Header
@@ -233,6 +234,7 @@ class FileTransferApp:
             self.timeout_var.set(settings.get("timeout", "10"))
             self.debug_mode_var.set(settings.get("debug_mode", False))
             self.copy_only_var.set(settings.get("copy_only", False))
+            self.enable_intra_disk_check = settings.get("enable_intra_disk_check", True)
             self.log_message("成功加载上次的设置。")
         except (FileNotFoundError, json.JSONDecodeError):
             self.log_message("未找到设置文件，使用默认设置。")
@@ -248,6 +250,7 @@ class FileTransferApp:
             "timeout": self.timeout_var.get(),
             "debug_mode": self.debug_mode_var.get(),
             "copy_only": self.copy_only_var.get(),
+            "enable_intra_disk_check": self.enable_intra_disk_check,
         }
         try:
             with open("settings.json", "w", encoding='utf-8') as f:
@@ -288,17 +291,21 @@ class FileTransferApp:
         
         # --- 智能模式检测 ---
         try:
-            # 仅在非“仅复制”模式下，才启用同盘快速移动
-            if not self.copy_only_var.get():
-                source_drive = os.path.splitdrive(os.path.abspath(source))[0]
-                target_drive = os.path.splitdrive(os.path.abspath(target))[0]
+            # 检查配置是否启用同盘检测
+            if self.enable_intra_disk_check:
+                # 仅在非“仅复制”模式下，才启用同盘快速移动
+                if not self.copy_only_var.get():
+                    source_drive = os.path.splitdrive(os.path.abspath(source))[0]
+                    target_drive = os.path.splitdrive(os.path.abspath(target))[0]
 
-                if source_drive.upper() == target_drive.upper():
-                    self.log_message(f"检测到同盘操作 ({source_drive})，将执行快速移动。")
-                    self._perform_intra_disk_move(source, target)
-                    return # 同盘移动完成后，结束函数
+                    if source_drive.upper() == target_drive.upper():
+                        self.log_message(f"检测到同盘操作 ({source_drive})，将执行快速移动。")
+                        self._perform_intra_disk_move(source, target)
+                        return # 同盘移动完成后，结束函数
+                else:
+                    self.log_message("“仅复制”模式已启用，将执行标准复制流程。")
             else:
-                self.log_message("“仅复制”模式已启用，将执行标准复制流程。")
+                self.log_message("同盘移动检测已在配置文件中禁用，强制执行跨盘逻辑。")
         except Exception as e:
             self.log_message(f"[警告] 无法自动检测磁盘驱动器: {e}。将继续执行跨盘逻辑。")
         # --- 结束智能模式检测 ---
@@ -965,13 +972,10 @@ class TransferLogic:
             self._debug_log(f"[主工-{threading.get_ident()}] 打包 {archive_name}...")
             self._run_command_with_retry(cmd_pack, cwd=self._long_path_prefix(self.source_dir))
 
-            self._debug_log(f"[主工-{threading.get_ident()}] 移动 {archive_name}...")
-            moved_archive_path = shutil.move(archive_path, self._long_path_prefix(self.target_dir))
-
-            self._debug_log(f"[主工-{threading.get_ident()}] 解压 {archive_name}...")
+            self._debug_log(f"[主工-{threading.get_ident()}] 直接从源盘解压 {archive_name} 到目标盘...")
             cmd_extract = [
-                self.seven_zip_path, 'x', 
-                self._long_path_prefix(moved_archive_path), 
+                self.seven_zip_path, 'x',
+                archive_path, # 直接使用源盘缓存区的压缩包路径
                 f'-o{self._long_path_prefix(self.target_dir)}',
                 '-y', '-mmt'
             ]
@@ -979,7 +983,7 @@ class TransferLogic:
 
             # 任务成功，返回结构化的清理指令
             return {
-                "files_to_delete": [moved_archive_path, file_list_path],
+                "files_to_delete": [archive_path, file_list_path], # 清理源盘的压缩包和文件列表
                 "source_paths_for_dir_cleanup": [f['path'] for f in task['files']]
             }
         
@@ -988,13 +992,13 @@ class TransferLogic:
             self.log_callback(f"恢复处理已存在的包 {pack_id}...")
             
             archive_name = f"pack_{pack_id}.7z"
-            moved_archive_path = self._long_path_prefix(os.path.join(self.target_dir, archive_name))
+            archive_path = self._long_path_prefix(os.path.join(self.cache_dir, archive_name))
             file_list_path = os.path.join(self.cache_dir, f"filelist_{pack_id}.txt")
 
-            self._debug_log(f"[主工-{threading.get_ident()}] 直接解压 {archive_name}...")
+            self._debug_log(f"[主工-{threading.get_ident()}] 直接从源盘缓存解压 {archive_name} 到目标盘...")
             cmd_extract = [
-                self.seven_zip_path, 'x', 
-                moved_archive_path, 
+                self.seven_zip_path, 'x',
+                archive_path,
                 f'-o{self._long_path_prefix(self.target_dir)}',
                 '-y', '-mmt'
             ]
@@ -1002,7 +1006,7 @@ class TransferLogic:
 
             # 任务成功，返回结构化的清理指令
             return {
-                "files_to_delete": [moved_archive_path, file_list_path],
+                "files_to_delete": [archive_path, file_list_path],
                 "source_paths_for_dir_cleanup": [f['path'] for f in task['files']]
             }
 
@@ -1120,7 +1124,7 @@ class TransferLogic:
 
     def _plan_recovery_tasks(self):
         """
-        在恢复任务前，扫描目标文件夹，为已存在但未完成的压缩包创建优先恢复任务。
+        在恢复任务前，扫描源盘缓存文件夹，为已存在但未完成的压缩包创建优先恢复任务。
         """
         self.log_callback("扫描恢复任务...")
         
@@ -1135,9 +1139,10 @@ class TransferLogic:
         # 创建一个从 pack_id 到任务的映射，以便快速查找
         pack_id_to_task = {t['pack_id']: t for t in full_task_plan if t['type'] == 'pack'}
         
-        # 扫描目标文件夹中的残留压缩包
+        # 扫描源盘缓存文件夹中的残留压缩包
         try:
-            for item in os.listdir(self.target_dir):
+            if not os.path.exists(self.cache_dir): return # 缓存目录不存在，无法恢复
+            for item in os.listdir(self.cache_dir):
                 if item.startswith("pack_") and item.endswith(".7z"):
                     try:
                         pack_id = int(item.split('_')[1].split('.')[0])
