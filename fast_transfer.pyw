@@ -66,8 +66,9 @@ class FileTransferApp:
         self.chunk_size_var = tk.StringVar(value="64")
         self.file_limit_var = tk.StringVar(value="500")
         self.timeout_var = tk.StringVar(value="10")
-        self.debug_mode_var = tk.BooleanVar(value=False)
         self.copy_only_var = tk.BooleanVar(value=False)
+        self.debug_mode_var = tk.BooleanVar(value=False) # Level 2
+        self.debug_log3 = False # Level 3, loaded from file
         self.enable_intra_disk_check = True # 将从配置文件加载
         
         # --- UI Layout ---
@@ -95,8 +96,8 @@ class FileTransferApp:
         ttk.Entry(self.settings_frame, textvariable=self.timeout_var, width=10).grid(row=1, column=3, padx=5, sticky="ew")
         mode_frame = ttk.Frame(self.settings_frame)
         mode_frame.grid(row=2, column=0, columnspan=4, pady=(10,0), sticky="w")
-        ttk.Checkbutton(mode_frame, text="调试模式", variable=self.debug_mode_var).pack(side=tk.LEFT, padx=(0, 15))
-        ttk.Checkbutton(mode_frame, text="仅复制 (不删除源文件)", variable=self.copy_only_var).pack(side=tk.LEFT)
+        ttk.Checkbutton(mode_frame, text="仅复制 (不删除源文件)", variable=self.copy_only_var).pack(side=tk.LEFT, padx=(0, 20))
+        ttk.Checkbutton(mode_frame, text="调试模式 (显示详细日志)", variable=self.debug_mode_var).pack(side=tk.LEFT)
 
         # Main Content
         self.content_frame = ttk.Frame(master, padding=(20, 10))
@@ -232,10 +233,16 @@ class FileTransferApp:
             self.chunk_size_var.set(settings.get("chunk_size", "64"))
             self.file_limit_var.set(settings.get("file_limit", "500"))
             self.timeout_var.set(settings.get("timeout", "10"))
-            self.debug_mode_var.set(settings.get("debug_mode", False))
             self.copy_only_var.set(settings.get("copy_only", False))
+            self.debug_mode_var.set(settings.get("gui_debug_mode", False))
+            self.debug_log3 = settings.get("debug_log3", False)
             self.enable_intra_disk_check = settings.get("enable_intra_disk_check", True)
-            self.log_message("成功加载上次的设置。")
+            
+            log_level_msg = "1 (静默)"
+            if self.debug_log3: log_level_msg = "3 (完全诊断)"
+            elif self.debug_mode_var.get(): log_level_msg = "2 (标准调试)"
+            self.log_message(f"成功加载上次的设置 (日志级别: {log_level_msg})。")
+
         except (FileNotFoundError, json.JSONDecodeError):
             self.log_message("未找到设置文件，使用默认设置。")
             pass
@@ -248,8 +255,9 @@ class FileTransferApp:
             "chunk_size": self.chunk_size_var.get(),
             "file_limit": self.file_limit_var.get(),
             "timeout": self.timeout_var.get(),
-            "debug_mode": self.debug_mode_var.get(),
             "copy_only": self.copy_only_var.get(),
+            "gui_debug_mode": self.debug_mode_var.get(),
+            "debug_log3": self.debug_log3,
             "enable_intra_disk_check": self.enable_intra_disk_check,
         }
         try:
@@ -321,6 +329,13 @@ class FileTransferApp:
             messagebox.showerror("设置错误", f"高级设置中的参数无效: {e}")
             return
 
+        # 根据设置决定日志级别
+        log_level = 1
+        if self.debug_log3:
+            log_level = 3
+        elif self.debug_mode_var.get():
+            log_level = 2
+
         self.start_button.config(state="disabled")
         self.settings_button.config(state="disabled")
         self.status_label.config(text="正在准备迁移...")
@@ -356,7 +371,7 @@ class FileTransferApp:
             chunk_file_limit=file_limit,
             timeout_seconds=timeout,
             resume_session=resume_session,
-            debug_mode=self.debug_mode_var.get(),
+            log_level=log_level,
             copy_only=self.copy_only_var.get()
         )
         
@@ -596,11 +611,11 @@ class FileTransferApp:
 
 class TransferLogic:
     def __init__(self, source_dir, target_dir, status_callback=print, log_callback=print, 
-                 max_workers=8, chunk_size_mb=64, chunk_file_limit=20000, timeout_seconds=15, resume_session=False, debug_mode=False, copy_only=False):
+                 max_workers=8, chunk_size_mb=64, chunk_file_limit=20000, timeout_seconds=15, resume_session=False, log_level=1, copy_only=False):
         self.source_dir = os.path.abspath(source_dir)
         self.target_dir = os.path.abspath(target_dir)
         self.status_callback = status_callback
-        self.log_callback = log_callback
+        self._raw_log_callback = log_callback # 保存原始的回调函数
         
         # Configurable parameters
         self.max_workers = max_workers
@@ -608,7 +623,7 @@ class TransferLogic:
         self.chunk_file_limit = chunk_file_limit
         self.timeout = timeout_seconds
         self.resume_session = resume_session
-        self.debug_mode = debug_mode
+        self.log_level = log_level
         self.copy_only = copy_only
 
         self.seven_zip_path = resource_path("7-Zip/7z.exe")
@@ -631,6 +646,7 @@ class TransferLogic:
 
         # 优雅退出机制
         self._stop_event = threading.Event()
+        self._transfer_failed = False
         self._active_processes = set()
         self._process_lock = threading.Lock()
 
@@ -645,7 +661,7 @@ class TransferLogic:
             if self.resume_session:
                 self.status_callback("检测到未完成的任务，正在恢复...")
                 if not self._load_session():
-                    self.log_callback("[警告] 加载会话失败，将作为新任务重新开始。")
+                    self._log_warning("加载会话失败，将作为新任务重新开始。")
                     self.resume_session = False
                     if os.path.exists(self.cache_dir):
                         shutil.rmtree(self.cache_dir)
@@ -664,7 +680,7 @@ class TransferLogic:
                 self._plan_recovery_tasks()
 
             if not self.task_plan and not self.recovery_tasks and not self.resume_session:
-                self.log_callback("没有需要执行的任务。")
+                self._log_info("没有需要执行的任务。")
                 self.status_callback("完成！", 100)
             else:
                 self.status_callback(f"3. 开始执行 {len(self.task_plan)} 个任务...")
@@ -680,33 +696,48 @@ class TransferLogic:
             # 2. 等待书记员完成最后写入并退出
             session_writer_thread.join()
             # 3. 在所有线程结束后，安全地清理缓存
-            if not self._stop_event.is_set():
+            if not self._stop_event.is_set() and not self._transfer_failed:
                 self.status_callback("6. 清理临时文件...")
                 self._cleanup()
 
     def stop(self):
         """外部调用的停止方法，用于触发优雅退出。"""
-        self.log_callback("收到停止信号...")
+        self._log_info("收到停止信号...")
         self._stop_event.set()
         
         # 立即终止所有由我们启动的7z.exe子进程
         with self._process_lock:
-            self._debug_log(f"正在终止 {len(self._active_processes)} 个活动进程...")
+            self._log_debug(f"正在终止 {len(self._active_processes)} 个活动进程...")
             for p in self._active_processes:
                 try:
                     p.kill()
                 except Exception as e:
-                    self._debug_log(f"终止进程 {p.pid} 失败: {e}")
+                    self._log_debug(f"终止进程 {p.pid} 失败: {e}")
             self._active_processes.clear()
 
-    def _debug_log(self, message):
-        """仅在调试模式下记录日志。"""
-        if self.debug_mode:
-            self.log_callback(message)
+    def _log_info(self, message):
+        """记录普通信息（级别 >= 2）"""
+        if self.log_level >= 2:
+            self._raw_log_callback(message)
+
+    def _log_warning(self, message):
+        """记录警告信息（级别 >= 2）"""
+        if self.log_level >= 2:
+            self._raw_log_callback(f"[警告] {message}")
+
+    def _log_error(self, message):
+        """记录错误信息（级别 >= 1）"""
+        if self.log_level >= 1:
+            self._raw_log_callback(f"[严重错误] {message}")
+
+    def _log_debug(self, message):
+        """记录详细调试信息（级别 >= 3）"""
+        if self.log_level >= 3:
+            self._raw_log_callback(message)
 
     def _prepare_environment(self):
         """创建缓存目录"""
-        self._debug_log(f"创建缓存目录: {self.cache_dir}")
+        self._log_debug(f"创建缓存目录: {self.cache_dir}")
         if os.path.exists(self.cache_dir):
             shutil.rmtree(self.cache_dir)
         os.makedirs(self.cache_dir)
@@ -744,10 +775,10 @@ class TransferLogic:
         large_file_threshold = min(dynamic_threshold, 256 * 1024 * 1024) # 256MB
         large_file_threshold = max(large_file_threshold, 16 * 1024 * 1024) # 16MB保底
 
-        self._debug_log(f"总文件数: {len(all_files)}, 总大小: {self.total_transfer_size / 1024 / 1024:.2f} MB")
-        self._debug_log(f"平均文件大小: {avg_size / 1024:.2f} KB")
+        self._log_debug(f"总文件数: {len(all_files)}, 总大小: {self.total_transfer_size / 1024 / 1024:.2f} MB")
+        self._log_debug(f"平均文件大小: {avg_size / 1024:.2f} KB")
         self.status_callback(f"大文件阈值动态设定为: {large_file_threshold / 1024 / 1024:.2f} MB")
-        self._debug_log(f"大文件阈值: {large_file_threshold} 字节")
+        self._log_debug(f"大文件阈值: {large_file_threshold} 字节")
 
         small_files_to_pack = []
         for file_info in all_files:
@@ -764,14 +795,14 @@ class TransferLogic:
 
         # 在分包前，随机打乱小文件列表。
         # 这是解决“老大难”问题的关键：确保每个包里的文件都来自不同目录，从而分散IO压力。
-        self._debug_log("正在随机化文件列表以优化IO负载...")
+        self._log_debug("正在随机化文件列表以优化IO负载...")
         random.shuffle(small_files_to_pack)
 
         # 新策略：以文件数量为基础，将任务尽可能平均地分配给每个工作线程
         if self.max_workers > 0 and small_files_to_pack:
             # 计算理论上每个包应该包含多少文件，以实现负载均衡
             ideal_files_per_pack = (len(small_files_to_pack) + self.max_workers - 1) // self.max_workers
-            self._debug_log(f"新分包策略: 目标是创建 {self.max_workers} 个包, 每个包约 {ideal_files_per_pack} 个文件。")
+            self._log_debug(f"新分包策略: 目标是创建 {self.max_workers} 个包, 每个包约 {ideal_files_per_pack} 个文件。")
         else:
             ideal_files_per_pack = self.chunk_file_limit # Fallback to old limit
 
@@ -803,8 +834,8 @@ class TransferLogic:
                 'pack_id': pack_id_counter
             })
         
-        self._debug_log(f"规划完成。大文件任务数: {len([t for t in self.task_plan if t['type'] == 'move_large'])}")
-        self._debug_log(f"规划完成。小文件包任务数: {len([t for t in self.task_plan if t['type'] == 'pack'])}")
+        self._log_debug(f"规划完成。大文件任务数: {len([t for t in self.task_plan if t['type'] == 'move_large'])}")
+        self._log_debug(f"规划完成。小文件包任务数: {len([t for t in self.task_plan if t['type'] == 'pack'])}")
 
 
     def _execute_plan(self):
@@ -815,8 +846,8 @@ class TransferLogic:
             self.status_callback("没有需要执行的任务。")
             return
 
-        cleanup_workers = self.max_workers
-        self._debug_log(f"启动主线程池({self.max_workers}工)和清理线程池({cleanup_workers}工)")
+        cleanup_workers = self.max_workers # 清理线程数与主工作线程数保持一致
+        self._log_debug(f"启动主线程池({self.max_workers}工)和清理线程池({cleanup_workers}工)")
 
         # 使用一个字典来跟踪所有正在进行的任务，包括它们的清理阶段
         self.active_futures = {}
@@ -828,7 +859,7 @@ class TransferLogic:
 
             # 1. 优先提交恢复任务
             if self.recovery_tasks:
-                self.log_callback(f"优先处理 {len(self.recovery_tasks)} 个已打包的恢复任务...")
+                self._log_info(f"优先处理 {len(self.recovery_tasks)} 个已打包的恢复任务...")
                 for task in self.recovery_tasks:
                     future = transfer_executor.submit(self._process_main_task, task)
                     self.active_futures[future] = task
@@ -851,7 +882,7 @@ class TransferLogic:
                     break
                 time.sleep(0.5)
         
-        self._debug_log("所有任务链已完成。")
+        self._log_debug("所有任务链已完成。")
 
     def _long_path_prefix(self, path):
         """为Windows路径添加长路径前缀'\\\\?\\'以支持超过260个字符的路径。"""
@@ -873,7 +904,7 @@ class TransferLogic:
 
         for i in range(retries):
             if self._stop_event.is_set():
-                self.log_callback("操作被用户取消。")
+                self._log_info("操作被用户取消。")
                 return
 
             process = None
@@ -903,14 +934,14 @@ class TransferLogic:
                     self._active_processes.discard(process)
                 process.kill()
                 if self._stop_event.is_set(): return
-                self.log_callback(f"[警告] 命令 {' '.join(cmd)} 超时({self.timeout}s)！正在进行第 {i + 1}/{retries} 次重试...")
+                self._log_warning(f"命令 {' '.join(cmd)} 超时({self.timeout}s)！正在进行第 {i + 1}/{retries} 次重试...")
                 if i == retries - 1:
                     raise
             except Exception as e:
                 with self._process_lock:
                     self._active_processes.discard(process)
                 # 仅在调试模式下显示完整的命令错误
-                self._debug_log(f"[错误] 命令 {' '.join(cmd)} 执行失败: {e}")
+                self._log_debug(f"[错误] 命令 {' '.join(cmd)} 执行失败: {e}")
                 raise
 
     def _copy_large_file_with_retry(self, source, dest, retries=3, delay=1.0):
@@ -921,10 +952,10 @@ class TransferLogic:
                 return # Success
             except (IOError, OSError) as e:
                 if i < retries - 1:
-                    self.log_callback(f"[警告] 复制大文件 {os.path.basename(source)} 失败，将在 {delay}s 后重试... ({e})")
+                    self._log_warning(f"复制大文件 {os.path.basename(source)} 失败，将在 {delay}s 后重试... ({e})")
                     time.sleep(delay)
                 else:
-                    self.log_callback(f"[严重错误] 多次尝试后，复制大文件 {os.path.basename(source)} 仍失败: {e}")
+                    self._log_error(f"多次尝试后，复制大文件 {os.path.basename(source)} 仍失败: {e}")
                     raise # 最终失败，将异常抛出
 
     def _remove_file_with_retry(self, path, retries=5, delay=0.2):
@@ -940,62 +971,54 @@ class TransferLogic:
                 except FileNotFoundError:
                     return True # 文件已经被其他线程删除，视为成功
                 except Exception as e:
-                    self._debug_log(f"[警告] 无法修改文件属性 {path}: {e}")
+                    self._log_debug(f"无法修改文件属性 {path}: {e}")
 
                 # 尝试删除
                 os.remove(prefixed_path)
                 return True # 删除成功
             except OSError as e:
                 if i < retries - 1:
-                    self._debug_log(f"[警告] 删除文件 {path} 失败，将在 {delay}s 后重试... ({e})")
+                    self._log_debug(f"删除文件 {path} 失败，将在 {delay}s 后重试... ({e})")
                     time.sleep(delay)
                 else:
-                    self.log_callback(f"[严重错误] 多次尝试后，删除文件 {path} 仍失败: {e}")
+                    self._log_error(f"多次尝试后，删除文件 {path} 仍失败: {e}")
                     return False # 最终失败
 
     def _process_main_task(self, task):
         """第一阶段：由主工人执行的高负载任务。成功后返回待清理文件列表。"""
-        if task['type'] == 'pack':
-            pack_id = task['pack_id'] # 关键修复：必须使用任务自带的、不变的ID
-            self.log_callback(f"开始处理包 {pack_id}...")
-            
-            archive_name = f"pack_{pack_id}.7z"
-            archive_path = self._long_path_prefix(os.path.join(self.cache_dir, archive_name))
-            file_list_path = os.path.join(self.cache_dir, f"filelist_{pack_id}.txt")
-
-            with open(file_list_path, 'w', encoding='utf-8') as f:
-                for file_info in task['files']:
-                    relative_path = os.path.relpath(file_info['path'], self.source_dir)
-                    f.write(relative_path + "\n")
-            
-            cmd_pack = [self.seven_zip_path, 'a', archive_path, f'@{file_list_path}', '-mx0', '-mmt']
-            self._debug_log(f"[主工-{threading.get_ident()}] 打包 {archive_name}...")
-            self._run_command_with_retry(cmd_pack, cwd=self._long_path_prefix(self.source_dir))
-
-            self._debug_log(f"[主工-{threading.get_ident()}] 直接从源盘解压 {archive_name} 到目标盘...")
-            cmd_extract = [
-                self.seven_zip_path, 'x',
-                archive_path, # 直接使用源盘缓存区的压缩包路径
-                f'-o{self._long_path_prefix(self.target_dir)}',
-                '-y', '-mmt'
-            ]
-            self._run_command_with_retry(cmd_extract)
-
-            # 任务成功，返回结构化的清理指令
-            return {
-                "files_to_delete": [archive_path, file_list_path], # 清理源盘的压缩包和文件列表
-                "source_paths_for_dir_cleanup": [f['path'] for f in task['files']]
-            }
-        
-        elif task['type'] == 'resume_extract':
+        if task['type'] == 'pack' or task['type'] == 'resume_extract':
             pack_id = task['pack_id']
-            self.log_callback(f"恢复处理已存在的包 {pack_id}...")
             
-            archive_name = f"pack_{pack_id}.7z"
-            archive_path = self._long_path_prefix(os.path.join(self.cache_dir, archive_name))
-            file_list_path = os.path.join(self.cache_dir, f"filelist_{pack_id}.txt")
+            if task['type'] == 'pack':
+                self._log_info(f"开始处理包 {pack_id}...")
+                archive_name = f"pack_{pack_id}.7z"
+                archive_path = self._long_path_prefix(os.path.join(self.cache_dir, archive_name))
+                file_list_path = os.path.join(self.cache_dir, f"filelist_{pack_id}.txt")
 
-            self._debug_log(f"[主工-{threading.get_ident()}] 直接从源盘缓存解压 {archive_name} 到目标盘...")
+                with open(file_list_path, 'w', encoding='utf-8') as f:
+                    for file_info in task['files']:
+                        relative_path = os.path.relpath(file_info['path'], self.source_dir)
+                        f.write(relative_path + "\n")
+                
+                # 1. 打包
+                cmd_pack = [self.seven_zip_path, 'a', archive_path, f'@{file_list_path}', '-mx0', '-mmt']
+                self._log_debug(f"[主工-{threading.get_ident()}] 打包 {archive_name}...")
+                self._run_command_with_retry(cmd_pack, cwd=self._long_path_prefix(self.source_dir))
+            else: # resume_extract
+                self._log_info(f"恢复处理已存在的包 {pack_id}...")
+                archive_name = f"pack_{pack_id}.7z"
+                archive_path = self._long_path_prefix(os.path.join(self.cache_dir, archive_name))
+                file_list_path = os.path.join(self.cache_dir, f"filelist_{pack_id}.txt")
+
+            # 2. 并行删除源文件
+            delete_future = None
+            source_files_to_delete = [f['path'] for f in task['files']]
+            if not self.copy_only:
+                self._log_info(f"包 {pack_id} 处理完成，提交源文件删除任务...")
+                delete_future = self.cleanup_executor.submit(self._delete_source_files_task, source_files_to_delete)
+            
+            # 3. 解压
+            self._log_debug(f"[主工-{threading.get_ident()}] 从源盘缓存解压 {archive_name} 到目标盘...")
             cmd_extract = [
                 self.seven_zip_path, 'x',
                 archive_path,
@@ -1004,10 +1027,11 @@ class TransferLogic:
             ]
             self._run_command_with_retry(cmd_extract)
 
-            # 任务成功，返回结构化的清理指令
+            # 任务成功，返回清理缓存所需的信息，以及删除任务的future
             return {
-                "files_to_delete": [archive_path, file_list_path],
-                "source_paths_for_dir_cleanup": [f['path'] for f in task['files']]
+                "type": "pack_cleanup",
+                "delete_future": delete_future,
+                "cache_files_to_delete": [archive_path, file_list_path]
             }
 
         elif task['type'] == 'move_large':
@@ -1019,121 +1043,146 @@ class TransferLogic:
             os.makedirs(self._long_path_prefix(os.path.dirname(target_path)), exist_ok=True)
 
             if self.copy_only:
-                self.log_callback(f"开始复制大文件: {filename}")
+                self._log_info(f"开始复制大文件: {filename}")
                 self._copy_large_file_with_retry(file_info['path'], target_path)
-                # 在复制模式下，没有源文件需要清理
-                return {
-                    "files_to_delete": [],
-                    "source_paths_for_dir_cleanup": []
-                }
+                # 无需清理
+                return { "type": "large_cleanup", "source_files_for_dir_cleanup": [] }
             else:
-                self.log_callback(f"开始移动大文件: {filename}")
+                self._log_info(f"开始移动大文件: {filename}")
                 shutil.move(self._long_path_prefix(file_info['path']), self._long_path_prefix(target_path))
-                # 在移动模式下，shutil.move已删除源文件，我们只需清理空目录
-                return {
-                    "files_to_delete": [],
-                    "source_paths_for_dir_cleanup": [file_info['path']]
-                }
+                # 移动后，源文件即被删除，只需清理空目录
+                return { "type": "large_cleanup", "source_files_for_dir_cleanup": [file_info['path']] }
 
     def _main_task_done_callback(self, future):
-        """第一层回调：主任务完成后，检查结果并派发清理任务。"""
+        """第一层回调：主任务完成后，根据结果启动不同的清理链。"""
         original_task = self.active_futures.pop(future, None)
-        if not original_task: return # 可能已被取消
+        if not original_task: return
 
         try:
-            # 获取主任务的结果（即结构化的清理指令）
-            cleanup_instructions = future.result()
+            result = future.result()
+            result_type = result.get("type")
 
-            # 如果是“仅复制”模式，则移除删除源文件的指令
-            if self.copy_only:
-                self._debug_log(f"仅复制模式：跳过任务 {original_task.get('task_id')} 的源文件清理。")
-                cleanup_instructions["source_paths_for_dir_cleanup"] = []
-            
-            # 派发清理任务（在复制模式下，这只会清理缓存和压缩包）
-            cleanup_future = self.cleanup_executor.submit(self._process_cleanup_task, cleanup_instructions)
-            self.active_futures[cleanup_future] = original_task # 跟踪清理任务
-            cleanup_future.add_done_callback(self._cleanup_task_done_callback)
+            if result_type == "pack_cleanup":
+                # 对于打包任务，启动一个依赖于“删除”和“解压”都完成的最终清理
+                delete_future = result.get("delete_future")
+                cache_files = result.get("cache_files_to_delete")
+
+                if delete_future:
+                    # 如果有删除任务，则将最终清理链接到它完成之后
+                    callback_future = delete_future.add_done_callback(
+                        lambda df: self._final_cleanup_callback(df, original_task, cache_files)
+                    )
+                else:
+                    # 如果是“仅复制”模式，没有删除任务，直接清理缓存
+                    self._log_debug(f"仅复制模式：跳过包 {original_task.get('pack_id')} 的源文件删除和空目录清理。")
+                    cleanup_future = self.cleanup_executor.submit(self._cleanup_cache_only, cache_files)
+                    self.active_futures[cleanup_future] = original_task
+                    cleanup_future.add_done_callback(self._cleanup_task_done_callback)
+
+            elif result_type == "large_cleanup":
+                # 对于大文件移动，只需清理空目录
+                source_files = result.get("source_files_for_dir_cleanup")
+                if source_files:
+                    cleanup_future = self.cleanup_executor.submit(self._cleanup_empty_dirs_task, source_files)
+                    self.active_futures[cleanup_future] = original_task
+                    cleanup_future.add_done_callback(self._cleanup_task_done_callback)
+                else: # 仅复制模式，无事可做
+                    self._mark_task_complete(original_task)
+                    self._update_progress(original_task)
 
         except Exception as e:
             # 主任务失败，记录错误，不进行清理
+            self._transfer_failed = True
             task_type = original_task.get('type', '未知')
-            self.log_callback(f"[严重错误] {task_type} 任务 {original_task.get('task_id')} 的主流程失败: {e}")
-            # 更新进度
-            failed_task_size = 0
-            if task_type == 'pack':
-                failed_task_size = sum(f['size'] for f in original_task.get('files', []))
-            elif task_type == 'move_large':
-                failed_task_size = original_task.get('file_info', {}).get('size', 0)
-            with self.progress_lock:
-                self.processed_size += failed_task_size
-                progress = (self.processed_size / self.total_transfer_size) * 100
-                self.status_callback(f"一个任务失败，已跳过", progress)
+            self._log_error(f"{task_type} 任务 {original_task.get('task_id')} 的主流程失败: {e}")
+            self._update_progress(original_task, failed=True)
 
-    def _process_cleanup_task(self, instructions):
-        """第二阶段：由清理工执行的低功耗任务，使用结构化指令。"""
-        if self._stop_event.is_set(): return
-        
-        files_to_delete = instructions.get("files_to_delete", [])
-        source_paths_for_dir_cleanup = instructions.get("source_paths_for_dir_cleanup", [])
+    def _delete_source_files_task(self, paths_to_delete):
+        """清理任务1：删除源文件，并返回被删除的路径列表用于后续空目录清理。"""
+        self._log_debug(f"[清理工-{threading.get_ident()}] 开始并行删除 {len(paths_to_delete)} 个源文件...")
+        for path in paths_to_delete:
+            if self._stop_event.is_set(): return []
+            self._remove_file_with_retry(path)
+        self._log_debug(f"[清理工-{threading.get_ident()}] 源文件删除完成。")
+        return paths_to_delete
 
-        self._debug_log(f"[清理工-{threading.get_ident()}] 开始清理 {len(files_to_delete) + len(source_paths_for_dir_cleanup)} 个相关项目...")
-
-        # 1. 删除指定的临时文件和源文件
-        # 对于打包任务，这里会包含源文件
-        for path in source_paths_for_dir_cleanup:
-             if self._stop_event.is_set(): return
-             self._remove_file_with_retry(path)
-        # 对于所有任务，这里包含缓存文件和压缩包
-        for path in files_to_delete:
+    def _cleanup_cache_only(self, cache_files):
+        """清理任务2：只清理缓存文件。"""
+        for path in cache_files:
             if self._stop_event.is_set(): return
             self._remove_file_with_retry(path)
-        
-        # 2. 只对原始的源文件路径进行空目录清理
-        if source_paths_for_dir_cleanup:
-            dummy_file_infos = [{'path': p} for p in source_paths_for_dir_cleanup]
+
+    def _cleanup_empty_dirs_task(self, source_paths):
+        """清理任务3：只清理空目录。"""
+        if source_paths:
+            dummy_file_infos = [{'path': p} for p in source_paths]
             self._cleanup_empty_dirs(dummy_file_infos)
-        
-        self._debug_log(f"[清理工-{threading.get_ident()}] 清理完成。")
+
+    def _final_cleanup_callback(self, delete_future, original_task, cache_files):
+        """第二层回调：在源文件删除后执行，负责清理缓存和空目录。"""
+        try:
+            # 1. 检查删除任务是否成功，并获取被删除的文件列表
+            deleted_source_files = delete_future.result()
+
+            # 2. 清理缓存文件
+            self._cleanup_cache_only(cache_files)
+
+            # 3. 清理空目录
+            self._cleanup_empty_dirs_task(deleted_source_files)
+            
+            # 4. 所有清理完成，标记任务
+            self._mark_task_complete(original_task)
+            self._update_progress(original_task)
+
+        except Exception as e:
+            self._transfer_failed = True
+            self._log_error(f"任务 {original_task.get('task_id')} 的最终清理流程失败: {e}")
+            self._update_progress(original_task, failed=True)
 
     def _cleanup_task_done_callback(self, future):
-        """第二层回调：清理任务完成后，最终标记整个原子任务为完成。"""
+        """用于简单清理任务（如仅清理缓存或仅清理空目录）的回调。"""
         original_task = self.active_futures.pop(future, None)
         if not original_task: return
 
         try:
             future.result() # 检查清理任务是否出错
-            # 整个原子任务成功，更新进度并标记完成
-            task_type = original_task.get('type')
-            task_size = 0
-            if task_type == 'pack':
-                task_size = sum(f['size'] for f in original_task.get('files', []))
-            elif task_type == 'move_large':
-                task_size = original_task.get('file_info', {}).get('size', 0)
-            
-            with self.progress_lock:
-                self.processed_size += task_size
-                progress = (self.processed_size / self.total_transfer_size) * 100
-                if int(progress) > self.last_reported_progress:
-                    self.last_reported_progress = int(progress)
-                    self.status_callback(f"进度 {int(progress)}%", progress)
-            
             self._mark_task_complete(original_task)
-
+            self._update_progress(original_task)
         except Exception as e:
-            self.log_callback(f"[严重错误] 任务 {original_task.get('task_id')} 的清理流程失败: {e}")
+            self._transfer_failed = True
+            self._log_error(f"任务 {original_task.get('task_id')} 的清理流程失败: {e}")
+            self._update_progress(original_task, failed=True)
+
+    def _update_progress(self, task, failed=False):
+        """统一的进度更新方法。"""
+        task_type = task.get('type')
+        task_size = 0
+        if task_type == 'pack' or task_type == 'resume_extract':
+            task_size = sum(f['size'] for f in task.get('files', []))
+        elif task_type == 'move_large':
+            task_size = task.get('file_info', {}).get('size', 0)
+        
+        with self.progress_lock:
+            self.processed_size += task_size
+            progress = (self.processed_size / self.total_transfer_size) * 100
+            if failed:
+                self.status_callback(f"一个任务失败，已跳过", progress)
+            elif int(progress) > self.last_reported_progress:
+                self.last_reported_progress = int(progress)
+                self.status_callback(f"进度 {int(progress)}%", progress)
 
     def _plan_recovery_tasks(self):
         """
         在恢复任务前，扫描源盘缓存文件夹，为已存在但未完成的压缩包创建优先恢复任务。
         """
-        self.log_callback("扫描恢复任务...")
+        self._log_info("扫描恢复任务...")
         
         try:
             with open(self.session_file_path, 'r', encoding='utf-8') as f:
                 session_data = json.load(f)
             full_task_plan = session_data.get('task_plan', [])
         except (IOError, json.JSONDecodeError):
-            self.log_callback("[警告] 无法读取会话文件进行恢复规划，跳过。")
+            self._log_warning("无法读取会话文件进行恢复规划，跳过。")
             return
 
         # 创建一个从 pack_id 到任务的映射，以便快速查找
@@ -1150,7 +1199,7 @@ class TransferLogic:
 
                         # 如果这个包对应的任务存在，且未完成，则创建恢复任务
                         if original_task and original_task['task_id'] not in self.completed_task_ids:
-                            self.log_callback(f"发现可恢复的压缩包: {item}")
+                            self._log_info(f"发现可恢复的压缩包: {item}")
                             
                             # 创建一个新的、特殊的恢复任务
                             recovery_task = original_task.copy()
@@ -1164,12 +1213,12 @@ class TransferLogic:
                         # 文件名不规范，忽略
                         continue
         except Exception as e:
-            self.log_callback(f"[警告] 扫描恢复任务时发生错误: {e}")
+            self._log_warning(f"扫描恢复任务时发生错误: {e}")
 
 
     def _save_session(self):
         """将当前任务计划保存到会话文件。"""
-        self._debug_log("创建会话文件...")
+        self._log_debug("创建会话文件...")
         session_data = {
             "source_dir": self.source_dir,
             "target_dir": self.target_dir,
@@ -1181,21 +1230,21 @@ class TransferLogic:
             with open(self.session_file_path, 'w', encoding='utf-8') as f:
                 json.dump(session_data, f, indent=4)
         except IOError as e:
-            self.log_callback(f"[严重错误] 无法写入会话文件: {e}")
+            self._log_error(f"无法写入会话文件: {e}")
 
     def _load_session(self):
         """
         根据新的原子性算法加载会话。
         任何未被记录为“完成”的任务都将被重新执行。
         """
-        self._debug_log("正在加载会话文件...")
+        self._log_debug("正在加载会话文件...")
         try:
             with open(self.session_file_path, 'r', encoding='utf-8') as f:
                 session_data = json.load(f)
 
             if session_data.get('source_dir') != self.source_dir or \
                session_data.get('target_dir') != self.target_dir:
-                self.log_callback("[警告] 会话文件与当前目录不匹配。将作为新任务开始。")
+                self._log_warning("会话文件与当前目录不匹配。将作为新任务开始。")
                 return False
 
             self.total_transfer_size = session_data.get('total_transfer_size', 0)
@@ -1217,8 +1266,8 @@ class TransferLogic:
                     # 任务未完成，加入执行计划
                     self.task_plan.append(task)
             
-            self._debug_log(f"会话加载成功。{len(self.completed_task_ids)}个任务已完成。")
-            self.log_callback(f"剩余任务数: {len(self.task_plan)}")
+            self._log_debug(f"会话加载成功。{len(self.completed_task_ids)}个任务已完成。")
+            self._log_info(f"剩余任务数: {len(self.task_plan)}")
             
             if self.total_transfer_size > 0:
                 progress = (self.processed_size / self.total_transfer_size) * 100
@@ -1226,7 +1275,7 @@ class TransferLogic:
 
             return True
         except (IOError, json.JSONDecodeError) as e:
-            self.log_callback(f"[错误] 读取或解析会话文件失败: {e}")
+            self._log_error(f"读取或解析会话文件失败: {e}")
             return False
 
     def _mark_task_complete(self, task):
@@ -1247,9 +1296,9 @@ class TransferLogic:
                 if task_id is None:
                     # 收到结束信号
                     if pending_ids:
-                        self._debug_log("[书记员] 收到结束信号，正在进行最后一次写入...")
+                        self._log_debug("[书记员] 收到结束信号，正在进行最后一次写入...")
                         self._write_session_to_disk()
-                    self._debug_log("[书记员] 最终写入完成，线程退出。")
+                    self._log_debug("[书记员] 最终写入完成，线程退出。")
                     break
                 
                 self.completed_task_ids.add(task_id)
@@ -1263,7 +1312,7 @@ class TransferLogic:
             # 每隔5秒，或者当有待处理的ID时，进行一次写入
             current_time = time.time()
             if pending_ids and (current_time - last_write_time > 5.0):
-                self._debug_log("[书记员] 批量写入会话...")
+                self._log_debug("[书记员] 批量写入会话...")
                 self._write_session_to_disk()
                 last_write_time = current_time
                 pending_ids = False
@@ -1301,7 +1350,7 @@ class TransferLogic:
                 os.replace(temp_file_path, self.session_file_path)
 
             except (IOError, json.JSONDecodeError) as e:
-                self.log_callback(f"[严重错误][书记员] 原子写入会话文件失败: {e}")
+                self._log_error(f"[书记员] 原子写入会话文件失败: {e}")
                 # 如果失败，尝试清理临时文件
                 if os.path.exists(temp_file_path):
                     os.remove(temp_file_path)
@@ -1324,7 +1373,7 @@ class TransferLogic:
                 try:
                     prefixed_dir = self._long_path_prefix(current_dir)
                     if not os.listdir(prefixed_dir):
-                        self._debug_log(f"清理空目录: {current_dir}")
+                        self._log_debug(f"清理空目录: {current_dir}")
                         os.rmdir(prefixed_dir)
                         # 如果删除成功，将目标指向父目录，进行下一次循环
                         current_dir = os.path.dirname(current_dir)
@@ -1333,15 +1382,30 @@ class TransferLogic:
                         break
                 except OSError as e:
                     # 如果因任何原因（如权限问题）删除失败，也停止回溯并记录日志
-                    self.log_callback(f"[警告] 无法清理目录 {current_dir}: {e}")
+                    self._log_warning(f"无法清理目录 {current_dir}: {e}")
                     break
 
 
     def _cleanup(self):
-        """删除缓存目录"""
+        """删除缓存目录，使用原生命令以提升速度并减少杀软CPU占用。"""
         if os.path.exists(self.cache_dir):
-            self._debug_log(f"清理缓存目录: {self.cache_dir}")
-            shutil.rmtree(self.cache_dir)
+            self._log_debug(f"使用 RMDIR /S /Q 清理缓存目录: {self.cache_dir}")
+            # RMDIR是Windows内置命令，可以高效删除整个目录树
+            # 我们需要确保路径不包含长路径前缀，因为cmd.exe不支持
+            safe_cache_dir = self.cache_dir
+            cmd = f'RMDIR /S /Q "{safe_cache_dir}"'
+            try:
+                # 使用 Popen 和 CREATE_NO_WINDOW 来隐藏命令行窗口
+                process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=subprocess.CREATE_NO_WINDOW)
+                stdout, stderr = process.communicate()
+                if process.returncode != 0:
+                    raise subprocess.CalledProcessError(process.returncode, cmd, output=stdout, stderr=stderr)
+            except Exception as e:
+                self._log_warning(f"使用 RMDIR 清理缓存失败: {e}。尝试使用 shutil.rmtree 作为后备。")
+                try:
+                    shutil.rmtree(self.cache_dir)
+                except Exception as se:
+                    self._log_error(f"后备方案 shutil.rmtree 也清理失败: {se}")
 
 def main():
     root = tk.Tk()
