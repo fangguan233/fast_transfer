@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 
 import json
+import logging
 import os
 import random
 import shutil
@@ -14,6 +15,55 @@ import tkinter as tk
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tkinter import filedialog, messagebox, ttk
+
+try:
+    import psutil
+except ImportError:
+    psutil = None
+
+
+def get_optimal_worker_count():
+    """
+    智能检测CPU核心数并返回推荐的并行进程数。
+    - 对于有大小核的CPU，返回大核数量。
+    - 对于全大核且有超线程的CPU，返回物理核心数。
+    - 对于全大核但无超线程的CPU，返回物理核心数。
+    """
+    if not psutil:
+        return 4 # 如果psutil未安装，返回一个保守的默认值
+
+    try:
+        p_cores = psutil.cpu_count(logical=False)
+        l_cores = psutil.cpu_count(logical=True)
+
+        if p_cores is None or l_cores is None:
+            return 8 # 获取失败
+
+        # 情况1: 传统超线程CPU (例如 12核24线程)
+        # 根据用户反馈，使用物理核心数的一半，以保证系统流畅。
+        if l_cores == p_cores * 2:
+            return max(1, p_cores // 2)
+
+        # 情况2: 无超线程的CPU (例如 8核8线程)
+        # 所有核心都是物理大核，可以全部利用。
+        if l_cores == p_cores:
+            return max(1, p_cores // 2)
+        
+        # 情况3: Intel大小核架构 (P-cores + E-cores)
+        # P-core是超线程的, E-core不是。
+        # P + E = p_cores
+        # 2P + E = l_cores
+        # 解方程得: P = l_cores - p_cores
+        # 这个公式可以精确计算出大核(P-core)的数量。
+        p_core_count = l_cores - p_cores
+        if p_core_count > 0:
+            return p_core_count
+        
+        # 其他未知架构的后备方案：使用物理核心数，这是一个相对安全的选择。
+        return max(1, p_cores // 2)
+
+    except Exception:
+        return 4 # 任何异常情况下都返回安全值
 
 
 def resource_path(relative_path):
@@ -30,118 +80,171 @@ def resource_path(relative_path):
 class FileTransferApp:
     def __init__(self, master):
         self.master = master
+        # 获取推荐的默认并行数
+        self.default_workers = get_optimal_worker_count()
         master.title("极速跨盘迁移工具")
-        master.geometry("600x750") # 稍微增加高度以容纳设置面板
+        try:
+            # 尝试设置窗口图标
+            icon_path = resource_path("app_icon.ico")
+            if os.path.exists(icon_path):
+                master.iconbitmap(icon_path)
+        except Exception:
+            # 如果图标文件不存在或格式错误，则静默失败
+            pass
+        master.geometry("600x650") # 稍微增加高度以容纳设置面板
         master.minsize(500, 450)
         master.configure(bg="#F0F0F0")
 
         # Style configuration
-        style = ttk.Style()
-        style.theme_use('clam')
+        self.style = ttk.Style()
+        self.style.theme_use('clam')
         
-        # Light Blue and White Theme
-        BG_COLOR = "#F0F0F0"
-        TEXT_COLOR = "#333333"
-        BUTTON_COLOR = "#5CACEE"  # 淡蓝色
-        BUTTON_ACTIVE_COLOR = "#4A90E2" # 稍深的淡蓝色
-        ENTRY_BG_COLOR = "#FFFFFF"
-        PROGRESS_BAR_COLOR = "#5CACEE"
+        # --- NextChat Inspired Style ---
+        BG_COLOR = "#F9FAFB"      # Very light gray, almost white
+        CONTENT_BG = "#FFFFFF"    # Pure white for content cards
+        TEXT_COLOR = "#1F2937"    # Dark slate gray
+        TEXT_SECONDARY = "#6B7280" # Medium gray for secondary text
+        PRIMARY_BLUE = "#3B82F6"  # Vibrant blue for primary actions
+        PRIMARY_BLUE_ACTIVE = "#2563EB" # Darker blue for active state
+        BORDER_COLOR = "#E5E7EB"  # Light gray for borders
+
+        master.configure(bg=BG_COLOR)
+
+        self.style.configure(".", background=BG_COLOR, foreground=TEXT_COLOR, font=('Microsoft YaHei UI', 9), borderwidth=0, relief="flat")
         
-        style.configure(".", background=BG_COLOR, foreground=TEXT_COLOR, font=('Microsoft YaHei UI', 9))
-        style.configure("TButton", padding=6, relief="flat", background=BUTTON_COLOR, foreground="white")
-        style.map("TButton", background=[('active', BUTTON_ACTIVE_COLOR)])
-        style.configure("TEntry", padding=5, relief="flat", fieldbackground=ENTRY_BG_COLOR, foreground=TEXT_COLOR)
-        style.configure("TProgressbar", thickness=15, background=PROGRESS_BAR_COLOR, troughcolor='#E0E0E0')
-        style.configure("TLabel", background=BG_COLOR, foreground=TEXT_COLOR)
-        style.configure("TCheckbutton", background=BG_COLOR, foreground=TEXT_COLOR)
-        style.map("TCheckbutton", background=[('active', BG_COLOR)], indicatorcolor=[('selected', BUTTON_COLOR)])
-        style.configure("TFrame", background=BG_COLOR)
-        style.configure("TLabelframe", background=BG_COLOR, bordercolor="#DDDDDD")
-        style.configure("TLabelframe.Label", background=BG_COLOR, foreground=TEXT_COLOR)
+        # --- Primary Button Style (e.g., "开始迁移") ---
+        self.style.configure("Primary.TButton", 
+                        padding=(12, 8),
+                        background=PRIMARY_BLUE, 
+                        foreground="white",
+                        font=('Microsoft YaHei UI', 10, 'bold'))
+        self.style.map("Primary.TButton",
+                  background=[('active', PRIMARY_BLUE_ACTIVE)])
+
+        # --- Secondary Button Style (e.g., "浏览", "设置") ---
+        self.style.configure("Secondary.TButton",
+                        padding=(10, 6),
+                        background=CONTENT_BG,
+                        foreground=TEXT_COLOR,
+                        borderwidth=1,
+                        bordercolor=BORDER_COLOR)
+        self.style.map("Secondary.TButton",
+                  background=[('active', BG_COLOR)],
+                  bordercolor=[('active', PRIMARY_BLUE)])
+
+        # --- Entry Style ---
+        self.style.configure("TEntry", 
+                        padding=8, 
+                        relief="flat", 
+                        fieldbackground=CONTENT_BG, 
+                        foreground=TEXT_COLOR,
+                        borderwidth=1,
+                        bordercolor=BORDER_COLOR)
+        self.style.map("TEntry",
+                  bordercolor=[('focus', PRIMARY_BLUE)])
+
+        # --- Progress Bar Style ---
+        self.style.configure("TProgressbar", 
+                        thickness=8, 
+                        background=PRIMARY_BLUE, 
+                        troughcolor=BORDER_COLOR,
+                        relief='flat')
+
+        # --- Label and Checkbutton ---
+        self.style.configure("TLabel", background=CONTENT_BG, foreground=TEXT_COLOR)
+        self.style.configure("Header.TLabel", background=BG_COLOR, font=('Microsoft YaHei UI', 16, "bold"))
+        self.style.configure("Footer.TLabel", background=BG_COLOR, foreground=TEXT_SECONDARY)
+        self.style.configure("Attribution.TLabel", background=BG_COLOR, foreground="#9CA3AF", font=('Microsoft YaHei UI', 7))
+        self.style.configure("TCheckbutton", background=CONTENT_BG, foreground=TEXT_COLOR)
+        self.style.map("TCheckbutton", 
+                  background=[('active', CONTENT_BG)], 
+                  indicatorcolor=[('selected', PRIMARY_BLUE)])
+
+        # --- Frame Styles ---
+        self.style.configure("TFrame", background=BG_COLOR)
+        self.style.configure("Content.TFrame", background=CONTENT_BG)
+        self.style.configure("TLabelframe", 
+                        background=CONTENT_BG, 
+                        relief='solid',
+                        borderwidth=1,
+                        bordercolor=BORDER_COLOR)
+        self.style.configure("TLabelframe.Label", 
+                        background=CONTENT_BG, 
+                        foreground=TEXT_SECONDARY)
+        
+        # --- Guide Window Styles ---
+        self.style.configure("Guide.TLabel", background=BG_COLOR)
+        self.style.configure("Guide.Header.TLabel", background=BG_COLOR, font=('Microsoft YaHei UI', 12, 'bold'))
+        self.style.configure("Guide.SubHeader.TLabel", background=BG_COLOR, font=('Microsoft YaHei UI', 10, 'bold'))
 
         # --- App Variables ---
         self.source_path = tk.StringVar()
         self.target_path = tk.StringVar()
-        self.max_workers_var = tk.StringVar(value="16")
+        self.show_performance_guide = tk.BooleanVar(value=True)
+        self.max_workers_var = tk.StringVar(value=str(self.default_workers))
         self.chunk_size_var = tk.StringVar(value="64")
         self.file_limit_var = tk.StringVar(value="500")
         self.timeout_var = tk.StringVar(value="10")
         self.copy_only_var = tk.BooleanVar(value=False)
         self.debug_mode_var = tk.BooleanVar(value=False) # Level 2
         self.debug_log3 = False # Level 3, loaded from file
+        self.performance_mode_var = tk.StringVar(value="performance") # 'performance' or 'normal'
         self.enable_intra_disk_check = True # 将从配置文件加载
         
         # --- UI Layout ---
         # Header
-        header_frame = ttk.Frame(master, padding=(10, 10))
+        header_frame = ttk.Frame(master, padding=(20, 15))
         header_frame.pack(fill="x")
-        ttk.Label(header_frame, text="极速跨盘迁移工具", font=("Microsoft YaHei UI", 16, "bold")).pack(side="left")
-        self.settings_button = ttk.Button(header_frame, text="⚙️ 设置", command=self.toggle_settings_panel)
-        self.settings_button.pack(side="right", pady=(0, 4))
-
-        # --- Settings Panel (initially hidden) ---
-        self.settings_panel_visible = False
-        self.settings_frame = ttk.LabelFrame(master, text="高级设置", padding=(15, 10))
-        # Grid configuration for settings
-        self.settings_frame.columnconfigure(1, weight=1)
-        self.settings_frame.columnconfigure(3, weight=1)
-        # Widgets inside settings panel
-        ttk.Label(self.settings_frame, text="并行进程数:").grid(row=0, column=0, sticky="w", pady=5)
-        ttk.Entry(self.settings_frame, textvariable=self.max_workers_var, width=10).grid(row=0, column=1, padx=5, sticky="ew")
-        ttk.Label(self.settings_frame, text="包大小上限(MB):").grid(row=0, column=2, sticky="w", padx=(15, 0), pady=5)
-        ttk.Entry(self.settings_frame, textvariable=self.chunk_size_var, width=10).grid(row=0, column=3, padx=5, sticky="ew")
-        ttk.Label(self.settings_frame, text="包内文件数上限:").grid(row=1, column=0, sticky="w", pady=5)
-        ttk.Entry(self.settings_frame, textvariable=self.file_limit_var, width=10).grid(row=1, column=1, padx=5, sticky="ew")
-        ttk.Label(self.settings_frame, text="超时上限(秒):").grid(row=1, column=2, sticky="w", padx=(15, 0), pady=5)
-        ttk.Entry(self.settings_frame, textvariable=self.timeout_var, width=10).grid(row=1, column=3, padx=5, sticky="ew")
-        mode_frame = ttk.Frame(self.settings_frame)
-        mode_frame.grid(row=2, column=0, columnspan=4, pady=(10,0), sticky="w")
-        ttk.Checkbutton(mode_frame, text="仅复制 (不删除源文件)", variable=self.copy_only_var).pack(side=tk.LEFT, padx=(0, 20))
-        ttk.Checkbutton(mode_frame, text="调试模式 (显示详细日志)", variable=self.debug_mode_var).pack(side=tk.LEFT)
+        ttk.Label(header_frame, text="极速跨盘迁移工具", style="Header.TLabel").pack(side="left")
+        self.settings_button = ttk.Button(header_frame, text="设置", command=self.open_settings_window, style="Secondary.TButton")
+        self.settings_button.pack(side="right")
 
         # Main Content
-        self.content_frame = ttk.Frame(master, padding=(20, 10))
-        self.content_frame.pack(fill="both", expand=True)
+        self.content_frame = ttk.Frame(master, padding=(25, 25), style="Content.TFrame")
+        self.content_frame.pack(fill="both", expand=True, padx=20, pady=(0, 20))
 
         # Source
-        ttk.Label(self.content_frame, text="源文件夹").pack(anchor="w")
-        source_frame = ttk.Frame(self.content_frame)
-        source_frame.pack(fill="x", pady=(0, 10))
+        ttk.Label(self.content_frame, text="源文件夹").pack(anchor="w", pady=(0,5))
+        source_frame = ttk.Frame(self.content_frame, style="Content.TFrame")
+        source_frame.pack(fill="x", pady=(0, 15))
         self.source_entry = ttk.Entry(source_frame, textvariable=self.source_path)
-        self.source_entry.pack(side="left", fill="x", expand=True, ipady=4)
-        self.source_browse_btn = ttk.Button(source_frame, text="浏览", command=self.select_source)
-        self.source_browse_btn.pack(side="left", padx=(5, 0))
+        self.source_entry.pack(side="left", fill="x", expand=True)
+        self.source_browse_btn = ttk.Button(source_frame, text="浏览", command=self.select_source, style="Secondary.TButton")
+        self.source_browse_btn.pack(side="left", padx=(10, 0))
 
         # Target
-        ttk.Label(self.content_frame, text="目标文件夹").pack(anchor="w")
-        target_frame = ttk.Frame(self.content_frame)
-        target_frame.pack(fill="x", pady=(0, 20))
+        ttk.Label(self.content_frame, text="目标文件夹").pack(anchor="w", pady=(0,5))
+        target_frame = ttk.Frame(self.content_frame, style="Content.TFrame")
+        target_frame.pack(fill="x", pady=(0, 25))
         self.target_entry = ttk.Entry(target_frame, textvariable=self.target_path)
-        self.target_entry.pack(side="left", fill="x", expand=True, ipady=4)
-        self.target_browse_btn = ttk.Button(target_frame, text="浏览", command=self.select_target)
-        self.target_browse_btn.pack(side="left", padx=(5, 0))
+        self.target_entry.pack(side="left", fill="x", expand=True)
+        self.target_browse_btn = ttk.Button(target_frame, text="浏览", command=self.select_target, style="Secondary.TButton")
+        self.target_browse_btn.pack(side="left", padx=(10, 0))
 
         # Start Button
-        self.start_button = ttk.Button(self.content_frame, text="开始迁移", command=self.start_transfer, style="TButton")
-        self.start_button.pack(pady=10, ipady=8, fill="x")
+        self.start_button = ttk.Button(self.content_frame, text="开始迁移", command=self.start_transfer, style="Primary.TButton")
+        self.start_button.pack(pady=10, fill="x")
 
         # Progress Bar
         self.progress = ttk.Progressbar(self.content_frame, orient="horizontal", length=500, mode="determinate")
-        self.progress.pack(pady=10, fill="x")
+        self.progress.pack(pady=15, fill="x")
         
         # Status Log
         self.status_label = ttk.Label(self.content_frame, text="状态: 等待操作", anchor="center")
-        self.status_label.pack(fill="x")
+        self.status_label.pack(fill="x", pady=5)
 
         # Footer
-        self.footer_frame = ttk.Frame(master, padding=(10, 5))
+        self.footer_frame = ttk.Frame(master, padding=(20, 10))
         self.footer_frame.pack(fill="x")
-        self.time_label = ttk.Label(self.footer_frame, text="已用时间: 0s")
+        self.time_label = ttk.Label(self.footer_frame, text="已用时间: 0s", style="Footer.TLabel")
         self.time_label.pack(side=tk.LEFT)
-        self.cache_label = ttk.Label(self.footer_frame, text="缓存占用: 0 MB")
+        self.cache_label = ttk.Label(self.footer_frame, text="缓存占用: 0 MB", style="Footer.TLabel")
         self.cache_label.pack(side=tk.LEFT, padx=20)
-        self.debug_button = ttk.Button(self.footer_frame, text="显示日志", command=self.toggle_log_view)
+        self.debug_button = ttk.Button(self.footer_frame, text="显示日志", command=self.toggle_log_view, style="Secondary.TButton")
         self.debug_button.pack(side="right")
+        # The label will take up the remaining space between the left and right elements
+        self.attribution_label = ttk.Label(self.footer_frame, text="@fangguan", style="Attribution.TLabel", anchor="center")
+        self.attribution_label.pack(side="left", fill="x", expand=True)
 
         # Log Area (initially hidden)
         self.log_frame = ttk.Frame(master)
@@ -165,62 +268,50 @@ class FileTransferApp:
         # Load previous settings
         self._load_settings()
 
+        # --- Performance Guide Frame (initially hidden) ---
+        self._create_performance_guide_frame()
+
         # --- Animations & Effects ---
         self._bind_hover_effects()
         self.source_path.trace_add("write", self._handle_path_change)
         self.target_path.trace_add("write", self._handle_path_change)
 
-    def toggle_settings_panel(self):
-        """“手风琴”式展开/收起动画，通过动画化一个占位符框架来实现"""
-        if hasattr(self, 'animating') and self.animating:
-            return
+        # Show performance guide on first launch, AFTER all widgets are created.
+        self.master.after(200, self._show_performance_guide_if_needed)
 
-        if not hasattr(self, 'animation_scaffold'):
-            self.animation_scaffold = ttk.Frame(self.master, height=1)
+    def open_settings_window(self):
+        # 创建一个新的顶级窗口
+        settings_win = tk.Toplevel(self.master)
+        try:
+            # 尝试设置窗口图标
+            icon_path = resource_path("app_icon.ico")
+            if os.path.exists(icon_path):
+                settings_win.iconbitmap(icon_path)
+        except Exception:
+            # 如果图标文件不存在或格式错误，则静默失败
+            pass
+        settings_win.title("设置")
+        settings_win.transient(self.master) # 依附于主窗口
+        settings_win.grab_set() # 模态窗口
 
-        if self.settings_panel_visible:
-            # 收起
-            target_height = self.settings_frame.winfo_height()
-            self.settings_frame.pack_forget()
-            self.animation_scaffold.pack(before=self.content_frame, fill='x')
-            self._animate_scaffold(target_height, 1, False)
-        else:
-            # 展开
-            # 先获取目标高度
-            self.settings_frame.pack(before=self.content_frame, padx=10, pady=(0, 10), fill="x")
-            self.master.update_idletasks()
-            target_height = self.settings_frame.winfo_reqheight()
-            self.settings_frame.pack_forget()
-            
-            self.animation_scaffold.pack(before=self.content_frame, fill='x')
-            self._animate_scaffold(1, target_height, True)
+        # 将主应用的变量传递给新窗口
+        SettingsWindow(settings_win, self)
+
+        # --- 窗口居中 ---
+        self.master.update_idletasks()
+        master_x = self.master.winfo_x()
+        master_y = self.master.winfo_y()
+        master_width = self.master.winfo_width()
+        master_height = self.master.winfo_height()
         
-        self.settings_panel_visible = not self.settings_panel_visible
+        settings_win.update_idletasks()
+        win_width = settings_win.winfo_width()
+        win_height = settings_win.winfo_height()
 
-    def _animate_scaffold(self, start_height, end_height, expanding):
-        """通过改变占位符高度来实现平滑的推拉效果"""
-        self.animating = True
-        duration = 200  # ms
-        frames = 20
-        interval = duration // frames
+        x = master_x + (master_width - win_width) // 2
+        y = master_y + (master_height - win_height) // 2
         
-        height_step = (end_height - start_height) / frames
-        
-        def _step(frame_num):
-            if frame_num > frames:
-                # 动画结束
-                self.animation_scaffold.pack_forget() # 移除占位符
-                if expanding:
-                    # 换上真正的设置面板
-                    self.settings_frame.pack(before=self.content_frame, padx=10, pady=(0, 10), fill="x")
-                self.animating = False
-                return
-
-            new_height = start_height + height_step * frame_num
-            self.animation_scaffold.config(height=int(new_height))
-            self.master.after(interval, lambda: _step(frame_num + 1))
-
-        _step(1)
+        settings_win.geometry(f'+{x}+{y}')
 
     def _load_settings(self):
         try:
@@ -229,14 +320,17 @@ class FileTransferApp:
             
             self.source_path.set(settings.get("source_path", ""))
             self.target_path.set(settings.get("target_path", ""))
-            self.max_workers_var.set(settings.get("max_workers", "16"))
+            # 如果配置文件中存在，则使用配置文件的值，否则保留智能计算的默认值
+            self.max_workers_var.set(settings.get("max_workers", str(self.default_workers)))
             self.chunk_size_var.set(settings.get("chunk_size", "64"))
             self.file_limit_var.set(settings.get("file_limit", "500"))
             self.timeout_var.set(settings.get("timeout", "10"))
             self.copy_only_var.set(settings.get("copy_only", False))
             self.debug_mode_var.set(settings.get("gui_debug_mode", False))
             self.debug_log3 = settings.get("debug_log3", False)
+            self.performance_mode_var.set(settings.get("performance_mode", "performance"))
             self.enable_intra_disk_check = settings.get("enable_intra_disk_check", True)
+            self.show_performance_guide.set(settings.get("show_performance_guide", True))
             
             log_level_msg = "1 (静默)"
             if self.debug_log3: log_level_msg = "3 (完全诊断)"
@@ -258,7 +352,9 @@ class FileTransferApp:
             "copy_only": self.copy_only_var.get(),
             "gui_debug_mode": self.debug_mode_var.get(),
             "debug_log3": self.debug_log3,
+            "performance_mode": self.performance_mode_var.get(),
             "enable_intra_disk_check": self.enable_intra_disk_check,
+            "show_performance_guide": self.show_performance_guide.get(),
         }
         try:
             with open("settings.json", "w", encoding='utf-8') as f:
@@ -282,17 +378,17 @@ class FileTransferApp:
         target = self.target_path.get()
 
         if not source or not target:
-            messagebox.showerror("错误", "请同时选择源文件夹和目标文件夹。")
+            CustomMessageBox.showerror("错误", "请同时选择源文件夹和目标文件夹。", parent=self.master)
             return
         if not os.path.isdir(source):
-            messagebox.showerror("错误", f"源文件夹路径无效:\n{source}")
+            CustomMessageBox.showerror("错误", f"源文件夹路径无效:\n{source}", parent=self.master)
             return
         if not os.path.isdir(target):
-            if messagebox.askyesno("确认", f"目标文件夹不存在:\n{target}\n\n是否要创建它？"):
+            if CustomMessageBox.askyesno("确认", f"目标文件夹不存在:\n{target}\n\n是否要创建它？", parent=self.master):
                 try:
                     os.makedirs(target)
                 except Exception as e:
-                    messagebox.showerror("错误", f"无法创建目标文件夹: {e}")
+                    CustomMessageBox.showerror("错误", f"无法创建目标文件夹: {e}", parent=self.master)
                     return
             else:
                 return
@@ -319,14 +415,23 @@ class FileTransferApp:
         # --- 结束智能模式检测 ---
 
         try:
-            max_workers = int(self.max_workers_var.get())
+            # 从StringVar获取基础并行数
+            base_max_workers = int(self.max_workers_var.get())
+            
+            # 根据性能模式调整实际的并行数
+            if self.performance_mode_var.get() == "normal":
+                # 普通模式：使用一半的线程数，但至少为1
+                max_workers = max(1, base_max_workers // 2)
+            else: # performance mode
+                max_workers = base_max_workers
+
             chunk_size_mb = int(self.chunk_size_var.get())
             file_limit = int(self.file_limit_var.get())
             timeout = int(self.timeout_var.get())
             if max_workers <= 0 or chunk_size_mb <= 0 or file_limit <= 0 or timeout <= 0:
                 raise ValueError("参数必须为正数")
         except ValueError as e:
-            messagebox.showerror("设置错误", f"高级设置中的参数无效: {e}")
+            CustomMessageBox.showerror("设置错误", f"高级设置中的参数无效: {e}", parent=self.master)
             return
 
         # 根据设置决定日志级别
@@ -352,13 +457,13 @@ class FileTransferApp:
         temp_session_file = os.path.join(temp_cache_dir, "transfer_session.json")
 
         if os.path.exists(temp_session_file):
-            if messagebox.askyesno("恢复任务", "检测到上次有未完成的迁移任务，是否继续？"):
+            if CustomMessageBox.askyesno("恢复任务", "检测到上次有未完成的迁移任务，是否继续？", parent=self.master):
                 resume_session = True
             else:
                 try:
                     shutil.rmtree(temp_cache_dir)
                 except OSError as e:
-                    messagebox.showerror("错误", f"无法清理旧的缓存目录: {e}\n请手动删除后重试。")
+                    CustomMessageBox.showerror("错误", f"无法清理旧的缓存目录: {e}\n请手动删除后重试。", parent=self.master)
                     self.start_button.config(state="normal")
                     self.settings_button.config(state="normal")
                     return
@@ -447,6 +552,77 @@ class FileTransferApp:
         # 使用 after 以确保StringVar更新后再执行
         self.master.after(1, self._adjust_window_width)
 
+    def _create_performance_guide_frame(self):
+        """Creates the performance guide frame but does not show it."""
+        self.guide_frame = ttk.LabelFrame(self.content_frame, text="⚡ 性能优化向导 ⚡", padding=15)
+        # DO NOT PACK IT HERE. It will be packed on demand by toggle_performance_guide.
+
+        BG_COLOR = "#F9FAFB"
+        self.guide_frame.configure(style="TLabelframe")
+        
+        # --- Widgets using .pack() inside the new frame ---
+        ttk.Label(self.guide_frame, text="为获得数倍性能提升，请按以下建议操作：", style="Guide.Header.TLabel").pack(anchor="w", pady=(0, 15))
+        
+        # --- Windows Defender ---
+        ttk.Label(self.guide_frame, text="1. 关闭 Windows Defender 实时保护（实测笔记本提升300%）", style="Guide.SubHeader.TLabel").pack(anchor="w", pady=(10, 5))
+        ttk.Label(self.guide_frame, text="开始菜单 > 设置 > 更新和安全 > Windows安全中心 > 病毒和威胁防护 > “病毒和威胁防护”设置 > 管理设置 > 关闭“实时保护”。", wraplength=450, justify="left", style="Guide.TLabel").pack(anchor="w", padx=(10,0))
+
+        ttk.Separator(self.guide_frame, orient='horizontal').pack(fill='x', pady=10)
+
+        # --- MscpManagerService ---
+        ttk.Label(self.guide_frame, text="2. 关闭 MscpManagerService（如果存在实测关闭再次提升100%） ", style="Guide.SubHeader.TLabel").pack(anchor="w", pady=(5, 5))
+        ttk.Label(self.guide_frame, text="此服务可能由某些管理软件安装。按 Win+R > 输入 services.msc > 找到 MscpManagerService > 右键停止。", wraplength=450, justify="left", style="Guide.TLabel").pack(anchor="w", padx=(10,0))
+
+        ttk.Separator(self.guide_frame, orient='horizontal').pack(fill='x', pady=10)
+
+        # --- 360 ---
+        ttk.Label(self.guide_frame, text="3. 退出 360安全卫士/杀毒", style="Guide.SubHeader.TLabel").pack(anchor="w", pady=(5, 5))
+        ttk.Label(self.guide_frame, text="在任务栏右下角找到360图标 > 右键 > 选择“退出”。", wraplength=450, justify="left", style="Guide.TLabel").pack(anchor="w", padx=(10,0))
+
+        ttk.Separator(self.guide_frame, orient='horizontal').pack(fill='x', pady=10)
+
+        # --- Huorong Security ---
+        ttk.Label(self.guide_frame, text="4. 关闭火绒安全", style="Guide.SubHeader.TLabel").pack(anchor="w", pady=(5, 5))
+        ttk.Label(self.guide_frame, text="打开火绒安全主界面 > 防护中心 > 关闭所有防护开关。", wraplength=450, justify="left", style="Guide.TLabel").pack(anchor="w", padx=(10,0))
+
+        # --- Bottom Controls ---
+        bottom_frame = ttk.Frame(self.guide_frame, style="TFrame")
+        bottom_frame.pack(fill="x", pady=(20, 0))
+        # The background is handled by the "TFrame" style, so the line below is removed.
+
+        self.dont_show_again_var = tk.BooleanVar(value=not self.show_performance_guide.get())
+        ttk.Checkbutton(bottom_frame, text="不再自动显示", variable=self.dont_show_again_var, style="TCheckbutton").pack(side="left")
+        ttk.Button(bottom_frame, text="隐藏向导", command=self.toggle_performance_guide, style="Secondary.TButton").pack(side="right")
+        
+        # Initially hide the frame by not packing it.
+
+    def toggle_performance_guide(self):
+        """Toggles the visibility of the performance guide frame and resizes the window."""
+        current_width = self.master.winfo_width()
+        current_height = self.master.winfo_height()
+        guide_height_change = 300
+
+        if self.guide_frame.winfo_viewable():
+            self.guide_frame.pack_forget()
+            new_height = max(self.master.minsize()[1], current_height - guide_height_change)
+            self.master.geometry(f"{current_width}x{new_height}")
+            
+            # Save the "don't show again" preference when hiding
+            if self.dont_show_again_var.get():
+                self.show_performance_guide.set(False)
+            else:
+                self.show_performance_guide.set(True)
+            self._save_settings()
+        else:
+            new_height = current_height + guide_height_change
+            self.master.geometry(f"{current_width}x{new_height}")
+            # Place it right after the start button, which is a reliable anchor.
+            self.guide_frame.pack(fill="x", pady=(15, 0), after=self.start_button)
+
+    def _show_performance_guide_if_needed(self):
+        if self.show_performance_guide.get():
+            self.toggle_performance_guide()
+
     def _adjust_window_width(self):
         try:
             # 获取字体用于测量
@@ -482,7 +658,7 @@ class FileTransferApp:
             return
         self._save_settings()
         if self.transfer_handler and self.start_button['state'] == 'disabled':
-            if messagebox.askyesno("退出确认", "迁移任务正在进行中，确定要中断并退出吗？\n所有已启动的压缩进程将被终止。"):
+            if CustomMessageBox.askyesno("退出确认", "迁移任务正在进行中，确定要中断并退出吗？\n所有已启动的压缩进程将被终止。", parent=self.master):
                 self.is_closing = True
                 self.log_message("正在中断任务...")
                 self.transfer_handler.stop()
@@ -521,10 +697,10 @@ class FileTransferApp:
                         self.master.after_cancel(self.timer_id)
                         self.timer_id = None
                     if error:
-                        messagebox.showerror("迁移失败", f"发生了一个错误: {error}")
+                        CustomMessageBox.showerror("迁移失败", f"发生了一个错误: {error}", parent=self.master)
                     else:
                         self.time_label.config(text=f"总耗时: {int(time.time() - self.start_time)}s")
-                        messagebox.showinfo("成功", "文件迁移完成！")
+                        CustomMessageBox.showinfo("成功", "文件迁移完成！", parent=self.master)
                     if self.master.winfo_exists():
                         self.start_button.config(state="normal")
                         self.settings_button.config(state="normal")
@@ -533,12 +709,12 @@ class FileTransferApp:
                 elif msg_type == "intra_disk_complete":
                     error, = args
                     if error:
-                        messagebox.showerror("盘内移动失败", f"发生了一个错误: {error}")
+                        CustomMessageBox.showerror("盘内移动失败", f"发生了一个错误: {error}", parent=self.master)
                         self.status_label.config(text="状态: 盘内移动失败")
                     else:
                         self.progress['value'] = 100
                         self.status_label.config(text="状态: 盘内移动完成！")
-                        messagebox.showinfo("成功", "盘内移动完成！")
+                        CustomMessageBox.showinfo("成功", "盘内移动完成！", parent=self.master)
                     if self.master.winfo_exists():
                         self.start_button.config(state="normal")
                         self.settings_button.config(state="normal")
@@ -607,6 +783,187 @@ class FileTransferApp:
                 self.gui_queue.put(("intra_disk_complete", e))
 
         threading.Thread(target=move_thread_func, daemon=True).start()
+
+
+# PerformanceGuideWindow class is now removed.
+
+
+class SettingsWindow:
+    def __init__(self, master, app):
+        self.master = master
+        self.app = app
+        
+        # --- Style Inheritance ---
+        BG_COLOR = "#F9FAFB"
+        CONTENT_BG = "#FFFFFF"
+        self.master.configure(bg=BG_COLOR)
+
+        # --- 同步主应用的变量 ---
+        self.performance_mode_var = tk.StringVar(value=self.app.performance_mode_var.get())
+        self.max_workers_var = tk.StringVar(value=self.app.max_workers_var.get())
+        self.chunk_size_var = tk.StringVar(value=self.app.chunk_size_var.get())
+        self.file_limit_var = tk.StringVar(value=self.app.file_limit_var.get())
+        self.timeout_var = tk.StringVar(value=self.app.timeout_var.get())
+        self.copy_only_var = tk.BooleanVar(value=self.app.copy_only_var.get())
+        self.debug_mode_var = tk.BooleanVar(value=self.app.debug_mode_var.get())
+        
+        # --- UI ---
+        main_frame = ttk.Frame(master, padding=20, style="TFrame")
+        main_frame.pack(fill="both", expand=True)
+        
+        # Performance Mode Section
+        mode_frame = ttk.LabelFrame(main_frame, text="性能模式", padding=15)
+        mode_frame.pack(fill="x", pady=(0, 10))
+        
+        ttk.Radiobutton(mode_frame, text="普通模式", variable=self.performance_mode_var, value="normal").pack(anchor="w")
+        ttk.Label(mode_frame, text="使用一半CPU线程，适合后台运行时不影响其他应用。", wraplength=350, justify="left").pack(anchor="w", padx=(20, 0), pady=(0, 10))
+        
+        ttk.Radiobutton(mode_frame, text="性能模式", variable=self.performance_mode_var, value="performance").pack(anchor="w")
+        ttk.Label(mode_frame, text="使用全部CPU线程以达到最快速度，但可能影响其他应用流畅度。", wraplength=350, justify="left").pack(anchor="w", padx=(20, 0))
+
+        # --- Advanced Settings (Collapsible) ---
+        self.advanced_frame_visible = False
+        self.advanced_frame_button = ttk.Button(main_frame, text="▶ 高级设置", command=self.toggle_advanced_frame, style="Secondary.TButton")
+        self.advanced_frame_button.pack(fill="x", pady=(10, 5))
+        
+        self.advanced_frame = ttk.Frame(main_frame, style="Content.TFrame")
+        # Grid configuration for settings
+        self.advanced_frame.columnconfigure(1, weight=1)
+        self.advanced_frame.columnconfigure(3, weight=1)
+        # Widgets inside settings panel
+        ttk.Label(self.advanced_frame, text="并行进程数:").grid(row=0, column=0, sticky="w", pady=5)
+        ttk.Entry(self.advanced_frame, textvariable=self.max_workers_var, width=10).grid(row=0, column=1, padx=5, sticky="ew")
+        ttk.Label(self.advanced_frame, text="包大小上限(MB):").grid(row=0, column=2, sticky="w", padx=(15, 0), pady=5)
+        ttk.Entry(self.advanced_frame, textvariable=self.chunk_size_var, width=10).grid(row=0, column=3, padx=5, sticky="ew")
+        ttk.Label(self.advanced_frame, text="包内文件数上限:").grid(row=1, column=0, sticky="w", pady=5)
+        ttk.Entry(self.advanced_frame, textvariable=self.file_limit_var, width=10).grid(row=1, column=1, padx=5, sticky="ew")
+        ttk.Label(self.advanced_frame, text="超时上限(秒):").grid(row=1, column=2, sticky="w", padx=(15, 0), pady=5)
+        ttk.Entry(self.advanced_frame, textvariable=self.timeout_var, width=10).grid(row=1, column=3, padx=5, sticky="ew")
+        
+        adv_mode_frame = ttk.Frame(self.advanced_frame, style="Content.TFrame")
+        adv_mode_frame.grid(row=2, column=0, columnspan=4, pady=(10,0), sticky="w")
+        ttk.Checkbutton(adv_mode_frame, text="仅复制 (不删除源文件)", variable=self.copy_only_var).pack(side=tk.LEFT, padx=(0, 20))
+        ttk.Checkbutton(adv_mode_frame, text="调试模式 (显示详细日志)", variable=self.debug_mode_var).pack(side=tk.LEFT)
+
+        # Save Button
+        button_frame = ttk.Frame(main_frame, style="TFrame")
+        button_frame.pack(fill="x", pady=(20, 0))
+        ttk.Button(button_frame, text="保存并关闭", command=self.save_and_close, style="Primary.TButton").pack()
+
+    def toggle_advanced_frame(self):
+        if self.advanced_frame_visible:
+            self.advanced_frame.pack_forget()
+            self.advanced_frame_button.config(text="▶ 高级设置")
+        else:
+            self.advanced_frame.pack(before=self.advanced_frame_button, fill="x", pady=5)
+            self.advanced_frame_button.config(text="▼ 高级设置")
+        self.advanced_frame_visible = not self.advanced_frame_visible
+
+    def save_and_close(self):
+        # 将此窗口的设置同步回主应用
+        self.app.performance_mode_var.set(self.performance_mode_var.get())
+        self.app.max_workers_var.set(self.max_workers_var.get())
+        self.app.chunk_size_var.set(self.chunk_size_var.get())
+        self.app.file_limit_var.set(self.file_limit_var.get())
+        self.app.timeout_var.set(self.timeout_var.get())
+        self.app.copy_only_var.set(self.copy_only_var.get())
+        self.app.debug_mode_var.set(self.debug_mode_var.get())
+        
+        # 触发主应用的保存
+        self.app._save_settings()
+        
+        # 关闭窗口
+        self.master.destroy()
+
+
+class CustomMessageBox:
+    def __init__(self, parent, title, message, dialog_type="info"):
+        self.parent = parent
+        self.result = None # For 'askyesno'
+
+        # --- Window Setup ---
+        self.top = tk.Toplevel(parent)
+        try:
+            # 尝试设置窗口图标
+            icon_path = resource_path("app_icon.ico")
+            if os.path.exists(icon_path):
+                self.top.iconbitmap(icon_path)
+        except Exception:
+            # 如果图标文件不存在或格式错误，则静默失败
+            pass
+        self.top.title(title)
+        self.top.transient(parent)
+        self.top.grab_set()
+        self.top.resizable(False, False)
+
+        # --- Style ---
+        BG_COLOR = "#F9FAFB"
+        CONTENT_BG = "#FFFFFF"
+        self.top.configure(bg=BG_COLOR)
+
+        # --- Layout ---
+        main_frame = ttk.Frame(self.top, padding=25, style="TFrame")
+        main_frame.pack(fill="both", expand=True)
+
+        # Icon (optional, based on type)
+        # For simplicity, we'll just use text labels for now.
+        # A more advanced version could use images.
+        
+        message_label = ttk.Label(main_frame, text=message, wraplength=350, justify="left", style="TLabel")
+        message_label.pack(pady=(0, 20))
+        message_label.configure(background=BG_COLOR) # Override style for this specific label
+
+        button_frame = ttk.Frame(main_frame, style="TFrame")
+        button_frame.pack(fill="x")
+        button_frame.columnconfigure(0, weight=1)
+        button_frame.columnconfigure(1, weight=1)
+
+        if dialog_type == "info" or dialog_type == "error":
+            ok_button = ttk.Button(button_frame, text="确定", command=self.ok, style="Primary.TButton")
+            ok_button.pack()
+        elif dialog_type == "askyesno":
+            no_button = ttk.Button(button_frame, text="否", command=self.no, style="Secondary.TButton")
+            no_button.pack(side="right", padx=(10, 0))
+            yes_button = ttk.Button(button_frame, text="是", command=self.yes, style="Primary.TButton")
+            yes_button.pack(side="right")
+
+        # --- Center Window ---
+        self.top.update_idletasks()
+        parent_x = parent.winfo_x()
+        parent_y = parent.winfo_y()
+        parent_width = parent.winfo_width()
+        parent_height = parent.winfo_height()
+        win_width = self.top.winfo_width()
+        win_height = self.top.winfo_height()
+        x = parent_x + (parent_width - win_width) // 2
+        y = parent_y + (parent_height - win_height) // 2
+        self.top.geometry(f'+{x}+{y}')
+
+        self.top.wait_window()
+
+    def ok(self):
+        self.top.destroy()
+
+    def yes(self):
+        self.result = True
+        self.top.destroy()
+
+    def no(self):
+        self.result = False
+        self.top.destroy()
+
+    @staticmethod
+    def showinfo(title, message, parent):
+        CustomMessageBox(parent, title, message, "info")
+
+    @staticmethod
+    def showerror(title, message, parent):
+        CustomMessageBox(parent, title, message, "error")
+
+    @staticmethod
+    def askyesno(title, message, parent):
+        dialog = CustomMessageBox(parent, title, message, "askyesno")
+        return dialog.result
 
 
 class TransferLogic:
