@@ -7,6 +7,7 @@ import random
 import shutil
 import stat
 import subprocess
+import ctypes
 import queue
 import sys
 import threading
@@ -66,6 +67,13 @@ def get_optimal_worker_count():
         return 4 # 任何异常情况下都返回安全值
 
 
+def is_admin():
+    """检查当前脚本是否以管理员权限运行"""
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin()
+    except:
+        return False
+
 def resource_path(relative_path):
     """ 获取资源的绝对路径，对开发模式和PyInstaller打包模式都有效 """
     try:
@@ -91,7 +99,7 @@ class FileTransferApp:
         except Exception:
             # 如果图标文件不存在或格式错误，则静默失败
             pass
-        master.geometry("600x650") # 稍微增加高度以容纳设置面板
+        master.geometry("600x810") # 稍微增加高度以容纳设置面板
         master.minsize(500, 450)
         master.configure(bg="#F0F0F0")
 
@@ -154,7 +162,6 @@ class FileTransferApp:
         self.style.configure("TLabel", background=CONTENT_BG, foreground=TEXT_COLOR)
         self.style.configure("Header.TLabel", background=BG_COLOR, font=('Microsoft YaHei UI', 16, "bold"))
         self.style.configure("Footer.TLabel", background=BG_COLOR, foreground=TEXT_SECONDARY)
-        self.style.configure("Attribution.TLabel", background=BG_COLOR, foreground="#9CA3AF", font=('Microsoft YaHei UI', 7))
         self.style.configure("TCheckbutton", background=CONTENT_BG, foreground=TEXT_COLOR)
         self.style.map("TCheckbutton", 
                   background=[('active', CONTENT_BG)], 
@@ -180,7 +187,7 @@ class FileTransferApp:
         # --- App Variables ---
         self.source_path = tk.StringVar()
         self.target_path = tk.StringVar()
-        self.show_performance_guide = tk.BooleanVar(value=True)
+        self.show_performance_guide = tk.BooleanVar(value=False)
         self.max_workers_var = tk.StringVar(value=str(self.default_workers))
         self.chunk_size_var = tk.StringVar(value="64")
         self.file_limit_var = tk.StringVar(value="500")
@@ -189,7 +196,8 @@ class FileTransferApp:
         self.debug_mode_var = tk.BooleanVar(value=False) # Level 2
         self.debug_log3 = False # Level 3, loaded from file
         self.performance_mode_var = tk.StringVar(value="performance") # 'performance' or 'normal'
-        self.enable_intra_disk_check = True # 将从配置文件加载
+        self.enable_intra_disk_check_var = tk.BooleanVar(value=True) # 将从配置文件加载
+        self.create_mklink_var = tk.BooleanVar(value=False)
         
         # --- UI Layout ---
         # Header
@@ -240,11 +248,13 @@ class FileTransferApp:
         self.time_label.pack(side=tk.LEFT)
         self.cache_label = ttk.Label(self.footer_frame, text="缓存占用: 0 MB", style="Footer.TLabel")
         self.cache_label.pack(side=tk.LEFT, padx=20)
+        
+        # 将署名放在左侧，紧挨着缓存信息
+        self.attribution_label = ttk.Label(self.footer_frame, text="@fangguan233", style="Footer.TLabel")
+        self.attribution_label.pack(side=tk.LEFT, padx=20)
+
         self.debug_button = ttk.Button(self.footer_frame, text="显示日志", command=self.toggle_log_view, style="Secondary.TButton")
         self.debug_button.pack(side="right")
-        # The label will take up the remaining space between the left and right elements
-        self.attribution_label = ttk.Label(self.footer_frame, text="@fangguan", style="Attribution.TLabel", anchor="center")
-        self.attribution_label.pack(side="left", fill="x", expand=True)
 
         # Log Area (initially hidden)
         self.log_frame = ttk.Frame(master)
@@ -329,8 +339,9 @@ class FileTransferApp:
             self.debug_mode_var.set(settings.get("gui_debug_mode", False))
             self.debug_log3 = settings.get("debug_log3", False)
             self.performance_mode_var.set(settings.get("performance_mode", "performance"))
-            self.enable_intra_disk_check = settings.get("enable_intra_disk_check", True)
-            self.show_performance_guide.set(settings.get("show_performance_guide", True))
+            self.enable_intra_disk_check_var.set(settings.get("enable_intra_disk_check", True))
+            self.show_performance_guide.set(settings.get("show_performance_guide", False))
+            self.create_mklink_var.set(settings.get("create_mklink", False))
             
             log_level_msg = "1 (静默)"
             if self.debug_log3: log_level_msg = "3 (完全诊断)"
@@ -353,8 +364,9 @@ class FileTransferApp:
             "gui_debug_mode": self.debug_mode_var.get(),
             "debug_log3": self.debug_log3,
             "performance_mode": self.performance_mode_var.get(),
-            "enable_intra_disk_check": self.enable_intra_disk_check,
+            "enable_intra_disk_check": self.enable_intra_disk_check_var.get(),
             "show_performance_guide": self.show_performance_guide.get(),
+            "create_mklink": self.create_mklink_var.get(),
         }
         try:
             with open("settings.json", "w", encoding='utf-8') as f:
@@ -377,6 +389,10 @@ class FileTransferApp:
         source = self.source_path.get()
         target = self.target_path.get()
 
+        if self.create_mklink_var.get() and not is_admin():
+            CustomMessageBox.showerror("权限不足", "创建符号链接(mklink)功能需要管理员权限。\n\n请右键点击本程序，选择“以管理员身份运行”。", parent=self.master)
+            return
+
         if not source or not target:
             CustomMessageBox.showerror("错误", "请同时选择源文件夹和目标文件夹。", parent=self.master)
             return
@@ -396,7 +412,7 @@ class FileTransferApp:
         # --- 智能模式检测 ---
         try:
             # 检查配置是否启用同盘检测
-            if self.enable_intra_disk_check:
+            if self.enable_intra_disk_check_var.get():
                 # 仅在非“仅复制”模式下，才启用同盘快速移动
                 if not self.copy_only_var.get():
                     source_drive = os.path.splitdrive(os.path.abspath(source))[0]
@@ -469,7 +485,7 @@ class FileTransferApp:
                     return
         
         self.transfer_handler = TransferLogic(
-            source, target, 
+            self.master, source, target, 
             self.update_status, self.log_message,
             max_workers=max_workers,
             chunk_size_mb=chunk_size_mb,
@@ -477,7 +493,8 @@ class FileTransferApp:
             timeout_seconds=timeout,
             resume_session=resume_session,
             log_level=log_level,
-            copy_only=self.copy_only_var.get()
+            copy_only=self.copy_only_var.get(),
+            create_mklink=self.create_mklink_var.get()
         )
         
         transfer_thread = threading.Thread(target=self._run_transfer_thread, daemon=False)
@@ -600,11 +617,11 @@ class FileTransferApp:
         """Toggles the visibility of the performance guide frame and resizes the window."""
         current_width = self.master.winfo_width()
         current_height = self.master.winfo_height()
-        guide_height_change = 300
-
+        
         if self.guide_frame.winfo_viewable():
             self.guide_frame.pack_forget()
-            new_height = max(self.master.minsize()[1], current_height - guide_height_change)
+            # 收起时，高度减少250
+            new_height = max(self.master.minsize()[1], current_height - 320)
             self.master.geometry(f"{current_width}x{new_height}")
             
             # Save the "don't show again" preference when hiding
@@ -614,7 +631,8 @@ class FileTransferApp:
                 self.show_performance_guide.set(True)
             self._save_settings()
         else:
-            new_height = current_height + guide_height_change
+            # 展开时，高度增加200
+            new_height = current_height + 250
             self.master.geometry(f"{current_width}x{new_height}")
             # Place it right after the start button, which is a reliable anchor.
             self.guide_frame.pack(fill="x", pady=(15, 0), after=self.start_button)
@@ -713,8 +731,11 @@ class FileTransferApp:
                         self.status_label.config(text="状态: 盘内移动失败")
                     else:
                         self.progress['value'] = 100
-                        self.status_label.config(text="状态: 盘内移动完成！")
-                        CustomMessageBox.showinfo("成功", "盘内移动完成！", parent=self.master)
+                        final_message = "盘内移动完成！"
+                        if self.create_mklink_var.get():
+                            final_message += "\n并已在原位置创建符号链接。"
+                        self.status_label.config(text=f"状态: {final_message}")
+                        CustomMessageBox.showinfo("成功", final_message, parent=self.master)
                     if self.master.winfo_exists():
                         self.start_button.config(state="normal")
                         self.settings_button.config(state="normal")
@@ -748,35 +769,30 @@ class FileTransferApp:
         _step(1)
 
     def _perform_intra_disk_move(self, source, target):
-        """在后台线程中执行同盘移动操作，移动源文件夹的内容。"""
+        """在后台线程中执行同盘移动操作，并根据设置创建符号链接。"""
         self.start_button.config(state="disabled")
         self.settings_button.config(state="disabled")
         self.status_label.config(text="状态: 正在执行盘内移动...")
-        self.progress['value'] = 10 # Give some visual feedback
+        self.progress['value'] = 10
         self.master.update_idletasks()
 
         def move_thread_func():
             try:
-                items = os.listdir(source)
-                total_items = len(items)
-                moved_items = 0
+                source_folder_name = os.path.basename(source)
+                destination_path = os.path.join(target, source_folder_name)
 
-                for item_name in items:
-                    source_item = os.path.join(source, item_name)
-                    dest_item = os.path.join(target, item_name)
+                if os.path.exists(destination_path):
+                    error_msg = f"目标文件夹 '{destination_path}' 已存在。\n请先手动移除或重命名。"
+                    self.gui_queue.put(("intra_disk_complete", error_msg))
+                    return
 
-                    if os.path.exists(dest_item):
-                        # 如果目标已存在，则跳过并记录
-                        self.log_message(f"[警告] 目标已存在，跳过移动: {dest_item}")
-                        continue
-                    
-                    # 移动每个文件或文件夹
-                    shutil.move(source_item, dest_item)
-                    moved_items += 1
-                    
-                    # 更新UI进度
-                    progress = (moved_items / total_items) * 100
-                    self.gui_queue.put(("status", f"正在移动: {item_name}", progress))
+                self.gui_queue.put(("status", f"正在移动: {source_folder_name}", 50))
+                shutil.move(source, destination_path)
+                
+                # 移动成功后，如果需要，则创建符号链接
+                if self.create_mklink_var.get():
+                    self.gui_queue.put(("status", "正在创建符号链接...", 90))
+                    self._create_symbolic_link_for_app(source, destination_path)
 
                 self.gui_queue.put(("intra_disk_complete", None))
             except Exception as e:
@@ -784,8 +800,30 @@ class FileTransferApp:
 
         threading.Thread(target=move_thread_func, daemon=True).start()
 
+    def _create_symbolic_link_for_app(self, link_path, target_path):
+        """为App创建一个符号链接，并将日志发送到GUI队列。"""
+        self.log_message(f"准备创建链接: 从 '{link_path}' 指向 '{target_path}'")
 
-# PerformanceGuideWindow class is now removed.
+        # 移动后，原路径不应存在
+        if os.path.exists(link_path):
+            self.log_message(f"[严重错误] 无法创建链接，因为原始路径 '{link_path}' 仍然存在。")
+            return
+
+        # 使用 shell=True 时，最好将整个命令作为字符串传递，以确保路径中的空格被正确处理。
+        cmd_string = f'mklink /D "{link_path}" "{target_path}"'
+        try:
+            creation_flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+            result = subprocess.run(
+                cmd_string, check=True, capture_output=True, text=True, 
+                encoding='gbk', errors='ignore', creationflags=creation_flags, shell=True
+            )
+            self.log_message("符号链接创建成功！")
+            if result.stdout: self.log_message(result.stdout)
+        except subprocess.CalledProcessError as e:
+            error_msg = f"创建符号链接失败。返回码: {e.returncode}\n错误输出: {e.stdout or e.stderr}"
+            self.log_message(f"[严重错误] {error_msg}")
+        except Exception as e:
+            self.log_message(f"[严重错误] 创建符号链接时发生未知错误: {e}")
 
 
 class SettingsWindow:
@@ -806,6 +844,8 @@ class SettingsWindow:
         self.timeout_var = tk.StringVar(value=self.app.timeout_var.get())
         self.copy_only_var = tk.BooleanVar(value=self.app.copy_only_var.get())
         self.debug_mode_var = tk.BooleanVar(value=self.app.debug_mode_var.get())
+        self.create_mklink_var = tk.BooleanVar(value=self.app.create_mklink_var.get())
+        self.enable_intra_disk_check_var = tk.BooleanVar(value=self.app.enable_intra_disk_check_var.get())
         
         # --- UI ---
         main_frame = ttk.Frame(master, padding=20, style="TFrame")
@@ -842,8 +882,22 @@ class SettingsWindow:
         
         adv_mode_frame = ttk.Frame(self.advanced_frame, style="Content.TFrame")
         adv_mode_frame.grid(row=2, column=0, columnspan=4, pady=(10,0), sticky="w")
-        ttk.Checkbutton(adv_mode_frame, text="仅复制 (不删除源文件)", variable=self.copy_only_var).pack(side=tk.LEFT, padx=(0, 20))
-        ttk.Checkbutton(adv_mode_frame, text="调试模式 (显示详细日志)", variable=self.debug_mode_var).pack(side=tk.LEFT)
+        ttk.Checkbutton(adv_mode_frame, text="仅复制 (不删除源文件)", variable=self.copy_only_var).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Checkbutton(adv_mode_frame, text="调试模式 (显示详细日志)", variable=self.debug_mode_var).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Checkbutton(adv_mode_frame, text="创建符号链接", variable=self.create_mklink_var).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Checkbutton(adv_mode_frame, text="启用同盘快速移动", variable=self.enable_intra_disk_check_var).pack(side=tk.LEFT)
+
+        # --- About/Info Section ---
+        info_text = (
+            "v1.0.0  @fangguan233 2024.07.19\n"
+            "如果发现bug 请提交issue\n"
+            "Github: https://github.com/fangguan233/fast_transfer/issues"
+        )
+        info_frame = ttk.LabelFrame(main_frame, text="关于", padding=15)
+        info_frame.pack(fill="x", pady=(10, 0))
+        
+        info_label = ttk.Label(info_frame, text=info_text, justify="left", wraplength=350)
+        info_label.pack(anchor="w")
 
         # Save Button
         button_frame = ttk.Frame(main_frame, style="TFrame")
@@ -868,6 +922,8 @@ class SettingsWindow:
         self.app.timeout_var.set(self.timeout_var.get())
         self.app.copy_only_var.set(self.copy_only_var.get())
         self.app.debug_mode_var.set(self.debug_mode_var.get())
+        self.app.create_mklink_var.set(self.create_mklink_var.get())
+        self.app.enable_intra_disk_check_var.set(self.enable_intra_disk_check_var.get())
         
         # 触发主应用的保存
         self.app._save_settings()
@@ -967,8 +1023,9 @@ class CustomMessageBox:
 
 
 class TransferLogic:
-    def __init__(self, source_dir, target_dir, status_callback=print, log_callback=print, 
-                 max_workers=8, chunk_size_mb=64, chunk_file_limit=20000, timeout_seconds=15, resume_session=False, log_level=1, copy_only=False):
+    def __init__(self, master_gui, source_dir, target_dir, status_callback=print, log_callback=print, 
+                 max_workers=8, chunk_size_mb=64, chunk_file_limit=20000, timeout_seconds=15, resume_session=False, log_level=1, copy_only=False, create_mklink=False):
+        self.master = master_gui
         self.source_dir = os.path.abspath(source_dir)
         self.target_dir = os.path.abspath(target_dir)
         self.status_callback = status_callback
@@ -982,6 +1039,7 @@ class TransferLogic:
         self.resume_session = resume_session
         self.log_level = log_level
         self.copy_only = copy_only
+        self.create_mklink = create_mklink
 
         self.seven_zip_path = resource_path("7-Zip/7z.exe")
         if not os.path.exists(self.seven_zip_path):
@@ -1056,6 +1114,20 @@ class TransferLogic:
             if not self._stop_event.is_set() and not self._transfer_failed:
                 self.status_callback("6. 清理临时文件...")
                 self._cleanup()
+
+                # 关键修复：在创建链接前，确保源目录被彻底删除
+                if not self.copy_only:
+                    self._log_info(f"准备删除源目录: {self.source_dir}")
+                    try:
+                        # 使用shutil.rmtree确保整个目录被删除
+                        shutil.rmtree(self._long_path_prefix(self.source_dir))
+                        self._log_info("源目录已成功删除。")
+                    except Exception as e:
+                        self._log_error(f"删除源目录失败: {e}。符号链接可能无法创建。")
+
+                if self.create_mklink:
+                    self.status_callback("7. 创建符号链接...")
+                    self._create_symbolic_link()
 
     def stop(self):
         """外部调用的停止方法，用于触发优雅退出。"""
@@ -1376,10 +1448,14 @@ class TransferLogic:
             
             # 3. 解压
             self._log_debug(f"[主工-{threading.get_ident()}] 从源盘缓存解压 {archive_name} 到目标盘...")
+            # 关键修复：确保在目标盘下创建与源文件夹同名的目录
+            final_output_dir = os.path.join(self.target_dir, os.path.basename(self.source_dir))
+            os.makedirs(self._long_path_prefix(final_output_dir), exist_ok=True)
+            
             cmd_extract = [
                 self.seven_zip_path, 'x',
                 archive_path,
-                f'-o{self._long_path_prefix(self.target_dir)}',
+                f'-o{self._long_path_prefix(final_output_dir)}', # 解压到正确的子目录
                 '-y', '-mmt'
             ]
             self._run_command_with_retry(cmd_extract)
@@ -1394,8 +1470,11 @@ class TransferLogic:
         elif task['type'] == 'move_large':
             file_info = task['file_info']
             filename = os.path.basename(file_info['path'])
+            
+            # 关键修复：确保大文件也被移动到正确的子目录中
+            final_output_dir = os.path.join(self.target_dir, os.path.basename(self.source_dir))
             relative_path = os.path.relpath(file_info['path'], self.source_dir)
-            target_path = os.path.join(self.target_dir, relative_path)
+            target_path = os.path.join(final_output_dir, relative_path)
             
             os.makedirs(self._long_path_prefix(os.path.dirname(target_path)), exist_ok=True)
 
@@ -1743,6 +1822,41 @@ class TransferLogic:
                     break
 
 
+    def _create_symbolic_link(self):
+        """在原始位置创建指向新位置的符号链接。"""
+        source_parent_dir = os.path.dirname(self.source_dir)
+        source_folder_name = os.path.basename(self.source_dir)
+        
+        # 目标链接的真实位置
+        new_target_path = os.path.join(self.target_dir, source_folder_name)
+        
+        # 原始链接的位置
+        link_path = self.source_dir
+
+        self._log_info(f"准备创建链接: 从 '{link_path}' 指向 '{new_target_path}'")
+
+        # 确保源目录本身已被删除，这是mklink的前提
+        if os.path.exists(link_path):
+            self._log_error(f"无法创建链接，因为原始路径 '{link_path}' 仍然存在。")
+            return
+
+        cmd = ['cmd', '/c', 'mklink', '/D', link_path, new_target_path]
+        try:
+            # 使用CREATE_NO_WINDOW来隐藏命令行窗口
+            creation_flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+            result = subprocess.run(cmd, check=True, capture_output=True, text=True, encoding='gbk', errors='ignore', creationflags=creation_flags)
+            self._log_info("符号链接创建成功！")
+            self._log_debug(result.stdout)
+        except subprocess.CalledProcessError as e:
+            self._log_error(f"创建符号链接失败。返回码: {e.returncode}")
+            self._log_error(f"错误输出: {e.stdout} {e.stderr}")
+            # 在GUI中显示一个更友好的错误
+            error_message = f"创建符号链接失败。\n\n原因: {e.stdout or e.stderr}\n\n请确认目标盘支持符号链接（通常需要NTFS格式）。"
+            CustomMessageBox.showerror("mklink失败", error_message, parent=self.master)
+        except Exception as e:
+            self._log_error(f"创建符号链接时发生未知错误: {e}")
+
+
     def _cleanup(self):
         """删除缓存目录，使用原生命令以提升速度并减少杀软CPU占用。"""
         if os.path.exists(self.cache_dir):
@@ -1771,3 +1885,10 @@ def main():
 
 if __name__ == "__main__":
     main()
+##
+#  v1.0.0
+#  @fangguan233 2024.07.19
+# 
+#  如果发现bug 请提交issue github：https://github.com/fangguan233/fast_transfer/issues 
+#
+##
