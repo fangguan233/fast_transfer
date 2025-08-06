@@ -66,8 +66,9 @@
 ## Bug反馈
 
 - **作者**: @fangguan233
-- **版本**: 1.0.0 (2024.07.19)
+- **版本**: 1.1.0 (2024.08.06)
 
 如果在使用中发现任何Bug，欢迎通过以下链接提交Issue：
 [https://github.com/fangguan233/fast_transfer/issues](https://github.com/fangguan233/fast_transfer/issues)
+
 
