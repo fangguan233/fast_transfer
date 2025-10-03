@@ -71,6 +71,12 @@
 | `create_mklink`            | 布尔值  | **[高级]** 是否在移动后，在原位置创建指向新位置的符号链接（mklink）。                            |
 | `context_menu_installed`   | 布尔值  | **[内部]** 用于标记右键菜单是否已成功安装。                                                      |
 
+## 致开发者 (For Developers)
+
+为了保证依赖库版本的统一性，避免潜在的环境冲突，强烈建议使用 **Conda** 来管理本项目的开发环境。
+
+您可以通过 `install_dependencies.bat` 脚本自动安装所需依赖。该脚本优先使用 Conda，如果检测到 Conda 环境，它会自动安装 `psutil` 库。
+
 ## Bug反馈
 
 - **作者**: @fangguan233
