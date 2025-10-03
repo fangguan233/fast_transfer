@@ -1,0 +1,7 @@
+2025-07-19 11:29:23,797 - INFO - --- PerformanceGuideWindow.__init__ started ---
+2025-07-19 11:29:23,797 - INFO - Style object received: <tkinter.ttk.Style object at 0x00000264582346E0>
+2025-07-19 11:29:23,797 - INFO - Creating Toplevel window...
+2025-07-19 11:29:23,805 - INFO - Icon set from: C:\myself_prodect\gamemove\create\app_icon.ico
+2025-07-19 11:29:23,815 - INFO - Toplevel window configured.
+2025-07-19 11:29:23,815 - INFO - Window background and alpha set.
+2025-07-19 11:29:23,815 - INFO - Creating main_frame with .grid()...

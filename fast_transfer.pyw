@@ -14,6 +14,8 @@ import threading
 import time
 import tkinter as tk
 import uuid
+import argparse
+import winreg as reg
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tkinter import filedialog, messagebox, ttk
 
@@ -89,6 +91,15 @@ class FileTransferApp:
     def __init__(self, master):
         self.master = master
         self.default_workers = get_optimal_worker_count()
+
+        # --- 调试日志 ---
+        self.executable_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+        self.settings_file_path = os.path.join(self.executable_dir, "settings.json")
+        self.log_file_path = os.path.join(self.executable_dir, "guide_window.log")
+        self._write_to_log("--- Application Start ---")
+        self._write_to_log(f"Command line args: {sys.argv}")
+        # --- 结束 ---
+
         master.title("极速跨盘迁移工具")
         try:
             icon_path = resource_path("app_icon.ico")
@@ -246,6 +257,7 @@ class FileTransferApp:
         self.start_time = 0
         self.timer_id = None
         self.gui_queue = queue.Queue()
+        self.launched_from_context_menu = False
 
         master.protocol("WM_DELETE_WINDOW", self._on_closing)
         self.is_closing = False
@@ -257,6 +269,20 @@ class FileTransferApp:
         self.target_path.trace_add("write", self._handle_path_change)
 
         self.master.after(200, self._show_performance_guide_if_needed)
+
+        # 检查并注册右键菜单
+        self.master.after(100, self._check_and_register_context_menu)
+
+        # 处理命令行参数
+        self._process_command_line_args()
+
+    def _write_to_log(self, message):
+        """将调试信息写入日志文件。"""
+        try:
+            with open(self.log_file_path, "a", encoding="utf-8") as f:
+                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {message}\n")
+        except Exception:
+            pass # 日志失败不应影响主程序
 
     def open_settings_window(self):
         settings_win = tk.Toplevel(self.master)
@@ -289,7 +315,7 @@ class FileTransferApp:
 
     def _load_settings(self):
         try:
-            with open("settings.json", "r", encoding='utf-8') as f:
+            with open(self.settings_file_path, "r", encoding='utf-8') as f:
                 settings = json.load(f)
             
             self.source_path.set(settings.get("source_path", ""))
@@ -314,7 +340,11 @@ class FileTransferApp:
 
         except (FileNotFoundError, json.JSONDecodeError):
             self.log_message("未找到设置文件，使用默认设置。")
-            pass
+            # 首次运行时，context_menu_installed 键不存在
+            self.context_menu_installed = False
+            return
+
+        self.context_menu_installed = settings.get("context_menu_installed", False)
 
     def _save_settings(self):
         settings = {
@@ -331,9 +361,10 @@ class FileTransferApp:
             "enable_intra_disk_check": self.enable_intra_disk_check_var.get(),
             "show_performance_guide": self.show_performance_guide.get(),
             "create_mklink": self.create_mklink_var.get(),
+            "context_menu_installed": getattr(self, 'context_menu_installed', False)
         }
         try:
-            with open("settings.json", "w", encoding='utf-8') as f:
+            with open(self.settings_file_path, "w", encoding='utf-8') as f:
                 json.dump(settings, f, indent=4)
         except IOError:
             self.log_message("[警告] 无法保存设置文件。")
@@ -657,6 +688,9 @@ class FileTransferApp:
                         self.time_label.config(text=f"总耗时: {int(time.time() - self.start_time)}s")
                         self.master.update_idletasks() # 强制UI刷新
                         CustomMessageBox.showinfo("成功", "文件迁移完成！", parent=self.master)
+                        if self.launched_from_context_menu:
+                            self.master.destroy()
+                            return
                     if self.master.winfo_exists():
                         self.start_button.config(state="normal")
                         self.settings_button.config(state="normal")
@@ -675,6 +709,9 @@ class FileTransferApp:
                         self.status_label.config(text=f"状态: {final_message}")
                         self.master.update_idletasks() # 强制UI刷新
                         CustomMessageBox.showinfo("成功", final_message, parent=self.master)
+                        if self.launched_from_context_menu:
+                            self.master.destroy()
+                            return
                     if self.master.winfo_exists():
                         self.start_button.config(state="normal")
                         self.settings_button.config(state="normal")
@@ -682,6 +719,159 @@ class FileTransferApp:
         except queue.Empty:
             pass
         self.master.after(100, self._process_gui_queue)
+
+    def _process_command_line_args(self):
+        """解析并处理从命令行传递的参数。"""
+        self._write_to_log("Parsing command line arguments...")
+        parser = argparse.ArgumentParser(description="Fast Transfer Tool command line interface.")
+        parser.add_argument("--action", type=str, choices=['move', 'symlink', 'copy'], help="The action to perform.")
+        parser.add_argument("--source", type=str, help="The source directory path.")
+        
+        try:
+            # sys.argv[1:] 是为了避免脚本名本身被解析
+            args = parser.parse_args(sys.argv[1:])
+            self._write_to_log(f"Parsed args: action={args.action}, source={args.source}")
+
+            # 只有当命令行参数存在时，才执行特殊启动流程
+            if args.source and os.path.isdir(args.source):
+                self._write_to_log("Source path is valid, starting context menu flow.")
+                self.launched_from_context_menu = True
+                
+                self.source_path.set(args.source)
+                
+                if args.action == 'copy':
+                    self.copy_only_var.set(True)
+                    self.create_mklink_var.set(False)
+                elif args.action == 'symlink':
+                    self.copy_only_var.set(False)
+                    self.create_mklink_var.set(True)
+                elif args.action == 'move':
+                    self.copy_only_var.set(False)
+                    self.create_mklink_var.set(False)
+                
+                # 关键步骤：立即调用，而不是使用 after()
+                self.select_target_and_start()
+            else:
+                self._write_to_log("No valid source path from command line, running in normal GUI mode.")
+
+        except SystemExit:
+            # argparse 在解析失败时会调用 sys.exit()，我们在这里捕获它以防止GUI关闭
+            pass
+        except Exception as e:
+            self.log_message(f"命令行参数解析错误: {e}")
+
+    def select_target_and_start(self):
+        """弹出目标选择对话框，如果用户选择了一个路径，则自动开始迁移。"""
+        self._write_to_log("select_target_and_start called.")
+        
+        # 强制Tkinter处理所有挂起的事件，确保窗口状态同步
+        self.master.update_idletasks()
+        
+        # 将主窗口置于最顶层，以确保对话框获得焦点
+        self.master.attributes('-topmost', True)
+        
+        self._write_to_log("Showing askdirectory dialog...")
+        target_path = filedialog.askdirectory(title="请选择目标文件夹", parent=self.master)
+        self._write_to_log(f"Dialog returned path: {target_path}")
+
+        # 操作完成后，取消顶层状态
+        self.master.attributes('-topmost', False)
+
+        if target_path:
+            self.target_path.set(target_path)
+            # 重新显示主窗口以进行迁移过程的可视化
+            self.master.deiconify()
+            # 使用 after 确保UI更新后再调用 start_transfer
+            self.master.after(50, self.start_transfer)
+        else:
+            # 如果用户取消选择，则直接关闭程序
+            self.master.destroy()
+
+    def _check_and_register_context_menu(self):
+        """检查是否已注册右键菜单，如果没有，则询问用户是否注册。"""
+        if getattr(self, 'context_menu_installed', False):
+            return
+
+        if CustomMessageBox.askyesno("集成右键菜单",
+                                     "您想将“Fast Transfer”添加到文件资源管理器的右键菜单中吗？\n\n"
+                                     "这将允许您直接右键点击文件夹进行快速迁移。\n"
+                                     "（此操作需要管理员权限）",
+                                     parent=self.master):
+            if not is_admin():
+                if CustomMessageBox.askyesno("需要管理员权限",
+                                             "此操作需要管理员权限才能修改注册表。\n\n"
+                                             "是否要以管理员身份重启本程序？",
+                                             parent=self.master):
+                    try:
+                        ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, " ".join(sys.argv), None, 1)
+                        self.master.destroy() # 关闭当前无权限的窗口
+                    except Exception as e:
+                        CustomMessageBox.showerror("错误", f"无法以管理员身份重启: {e}", parent=self.master)
+                return
+
+            # 如果已经是管理员，直接注册
+            self._register_context_menu()
+
+    def _register_context_menu(self):
+        """向Windows注册表写入右键菜单项（健壮版）。"""
+        try:
+            if getattr(sys, 'frozen', False):
+                executable_path = sys.executable
+                command_prefix = f'"{executable_path}"'
+                icon_path = f'"{executable_path}",0'
+            else:
+                pythonw_path = os.path.join(sys.prefix, 'pythonw.exe')
+                if not os.path.exists(pythonw_path):
+                    pythonw_path = os.path.join(os.path.dirname(sys.executable), 'pythonw.exe')
+                if not os.path.exists(pythonw_path):
+                     raise FileNotFoundError("无法定位 pythonw.exe")
+                script_path = os.path.abspath(__file__)
+                command_prefix = f'"{pythonw_path}" "{script_path}"'
+                icon_path = f'"{pythonw_path}",0'
+
+            # 定义子命令
+            sub_commands = {
+                "01_move": ("快速移动至...", "move"),
+                "02_symlink": ("创建符号链接的移动至...", "symlink"),
+                "03_copy": ("复制到...", "copy")
+            }
+
+            # 应用于不同的右键菜单位置
+            base_key_paths = [r"Directory\shell", r"Directory\Background\shell", r"Drive\shell"]
+            
+            for base_path in base_key_paths:
+                # 1. 创建主菜单项
+                main_key_path = f"{base_path}\\fast_transfer"
+                with reg.CreateKey(reg.HKEY_CLASSES_ROOT, main_key_path) as main_key:
+                    reg.SetValueEx(main_key, "MUIVerb", 0, reg.REG_SZ, "Fast Transfer")
+                    reg.SetValueEx(main_key, "Icon", 0, reg.REG_SZ, icon_path)
+                    # 声明这是一个有子菜单的项
+                    reg.SetValueEx(main_key, "SubCommands", 0, reg.REG_SZ, "")
+
+                # 2. 在主菜单项下创建 shell 子键，用于存放子命令
+                shell_key_path = f"{main_key_path}\\shell"
+                with reg.CreateKey(reg.HKEY_CLASSES_ROOT, shell_key_path) as shell_key:
+                    for cmd_key, (name, action) in sub_commands.items():
+                        # 3. 为每个子命令创建自己的键
+                        with reg.CreateKey(shell_key, cmd_key) as sub_key:
+                            reg.SetValueEx(sub_key, "", 0, reg.REG_SZ, name)
+                            # 4. 在子命令键下创建 command 键并设置其值
+                            # 注意：对于文件夹背景（右键点空白处），使用 %V。对于文件夹本身，使用 %1。
+                            # 为了统一和兼容性，"%V" 在大多数情况下都能良好工作。
+                            source_arg = '"%V"' if "Background" in base_path else '"%1"'
+                            command_str = f'{command_prefix} --action {action} --source {source_arg}'
+                            with reg.CreateKey(sub_key, "command") as command_key:
+                                reg.SetValueEx(command_key, "", 0, reg.REG_SZ, command_str)
+            
+            CustomMessageBox.showinfo("成功", "右键菜单已成功添加！", parent=self.master)
+            self.context_menu_installed = True
+            self._save_settings()
+
+        except PermissionError:
+             CustomMessageBox.showerror("权限错误", "无法写入注册表。请确保以管理员身份运行。", parent=self.master)
+        except Exception as e:
+            CustomMessageBox.showerror("注册失败", f"添加右键菜单时发生错误: {e}", parent=self.master)
+
 
     def _animate_progress(self, target_value):
         """平滑更新进度条的动画"""
@@ -819,7 +1009,7 @@ class SettingsWindow:
         ttk.Checkbutton(adv_mode_frame, text="启用同盘快速移动", variable=self.enable_intra_disk_check_var).pack(side=tk.LEFT)
 
         info_text = (
-            "v1.0.0  @fangguan233 2024.07.19\n"
+            "v1.2.0  @fangguan233 2025.10.3\n"
             "如果发现bug 请提交issue\n"
             "Github: https://github.com/fangguan233/fast_transfer/issues"
         )
